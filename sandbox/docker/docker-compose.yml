@@ -1,0 +1,149 @@
+version: "3.9"
+
+# Stack de observabilidade 100% gratuito/open-source:
+#   otel-collector -> recebe OTLP (traces/logs/métricas) da app e roteia
+#   tempo          -> armazena e serve traces
+#   loki           -> armazena e serve logs
+#   prometheus     -> armazena e serve métricas
+#   grafana        -> visualização unificada dos três, com correlação
+#   billing-simulation -> a app NestJS de exemplo, consumindo a SDK
+#
+# Subir tudo (a partir da raiz do repositório):
+#   docker compose -f sandbox/docker/docker-compose.yml up --build
+#
+# Grafana:    http://localhost:3000       (usuário/senha: admin/admin)
+# App:        http://localhost:3001
+# Prometheus: http://localhost:9090
+# Tempo API:  http://localhost:3200
+# Loki API:   http://localhost:3100
+# Kafka:      localhost:9092 (do host) / kafka:9092 (de outros containers)
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  tempo-data:
+  loki-data:
+  grafana-data:
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "8889:8889" # métricas expostas pro Prometheus fazer scrape
+    depends_on:
+      - tempo
+      - loki
+    networks:
+      - observability
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.10.0
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200" # API/UI query do Tempo
+    networks:
+      - observability
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki-config.yaml"]
+    volumes:
+      - ./loki-config.yaml:/etc/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command: ["--config.file=/etc/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlSearch"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # Broker único em modo KRaft (sem Zookeeper) — combina os papéis de broker
+  # e controller no mesmo processo. Suficiente pra simulação; nunca usar
+  # esse layout em produção (sem réplica de controller = sem tolerância a
+  # falha do metadata quorum).
+  #
+  # Importante: KAFKA_ADVERTISED_LISTENERS aponta pro hostname do container
+  # (`kafka`), não `localhost` — é esse endereço que o Kafka devolve pros
+  # clients depois do bootstrap inicial, e billing-simulation conecta de
+  # DENTRO da rede `observability`, não do host.
+  kafka:
+    image: apache/kafka:4.1.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "9092:9092"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  billing-simulation:
+    build:
+      context: ../..
+      dockerfile: sandbox/Dockerfile
+    environment:
+      PORT: 3000
+      OTEL_SERVICE_NAME: billing-simulation
+      OTEL_DEPLOYMENT_ENVIRONMENT: sandbox
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      KAFKA_BROKERS: kafka:9092
+    ports:
+      - "3001:3000"
+    depends_on:
+      - otel-collector
+      - kafka
+    networks:
+      - observability
+    restart: unless-stopped

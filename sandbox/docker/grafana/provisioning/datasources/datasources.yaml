@@ -1,0 +1,60 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: GET
+      # Clique num span no Tempo -> abre os logs correlacionados no Loki
+      # (usa o trace_id/span_id nativos que o Loki extrai automaticamente
+      # de logs ingeridos via OTLP).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true
+        filterBySpanID: false
+        tags:
+          - key: service.name
+            value: service_name
+      # Clique num span -> vê métricas relacionadas no Prometheus
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        tags:
+          - key: service.name
+            value: service_name
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      # Clique num log com trace_id -> abre o trace correspondente no Tempo
+      derivedFields:
+        - datasourceUid: tempo
+          matcherType: label
+          matcherRegex: "trace_id"
+          name: TraceID
+          url: "$${__value.raw}"
+
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    editable: true

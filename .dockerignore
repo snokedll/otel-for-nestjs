@@ -1,0 +1,9 @@
+node_modules
+sandbox/node_modules
+dist
+sandbox/dist
+.git
+.gitignore
+*.log
+npm-debug.log*
+.DS_Store

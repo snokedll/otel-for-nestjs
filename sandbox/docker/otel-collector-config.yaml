@@ -1,0 +1,51 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  # Traces -> Tempo, via OTLP gRPC nativo do Tempo
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Logs -> Loki, via endpoint OTLP nativo do Loki (Loki 3.x+).
+  # Importante: o path é /otlp (sem /v1/logs) -- o exporter otlphttp
+  # completa sozinho com /v1/logs, resultando em /otlp/v1/logs, que é
+  # o path real que o Loki espera.
+  otlphttp/loki:
+    endpoint: "http://loki:3100/otlp"
+    tls:
+      insecure: true
+
+  # Métricas -> expostas num endpoint /metrics que o Prometheus faz scrape
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Sem isso, atributos de Resource (service.name, deployment.environment.name,
+    # ...) ficam só nos traces/logs -- métricas não carregam Resource por
+    # padrão no formato Prometheus. Com isso, viram labels em toda métrica,
+    # permitindo filtrar/agrupar por ambiente também no Prometheus/Grafana.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
