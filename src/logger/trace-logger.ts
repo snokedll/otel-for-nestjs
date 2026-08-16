@@ -32,9 +32,9 @@ interface ParsedErrorCallArgs extends ParsedCallArgs {
   error?: Error;
 }
 
-function createPinoLogger(): PinoLogger {
+function createPinoLogger(level: LogLevel): PinoLogger {
   return pino({
-    level: process.env.LOG_LEVEL ?? 'info',
+    level,
     serializers: { err: pino.stdSerializers.err },
     transport: {
       target: 'pino-pretty',
@@ -102,11 +102,22 @@ function parseErrorCallArgs(message: unknown, optionalParams: unknown[]): Parsed
  * exported too, not just logs the application emits explicitly.
  */
 export class TraceLogger implements LoggerService {
-  private readonly pinoLogger: PinoLogger = createPinoLogger();
+  private readonly pinoLogger: PinoLogger;
   private readonly otelLogger: OtelLogger = logs.getLogger('@snokedll/otel-for-nestjs');
 
-  /** @param context prefixed onto every log call unless overridden per-call. */
-  constructor(private readonly context?: string) {}
+  /**
+   * @param context prefixed onto every log call unless overridden per-call.
+   * @param consoleLevel minimum level written to the console (pino). Does
+   * not affect what is emitted via the OpenTelemetry Logs API — every call
+   * always emits a `LogRecord`, regardless of this setting. Defaults to
+   * `'info'`.
+   */
+  constructor(
+    private readonly context?: string,
+    private readonly consoleLevel: LogLevel = 'info',
+  ) {
+    this.pinoLogger = createPinoLogger(this.consoleLevel);
+  }
 
   private emit(level: LogLevel, message: string, metadata?: LogMetadata, contextOverride?: string, error?: Error): void {
     const context = contextOverride ?? this.context;

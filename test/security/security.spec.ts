@@ -127,6 +127,18 @@ describe('security: algorithmic complexity / DoS resistance', () => {
     await firstValueFrom(messageInterceptor.intercept(context, callHandlerFor(() => 'ok')));
     expect(performance.now() - start).toBeLessThan(200);
   });
+
+  it('resolves a configured endpoint with a huge run of non-trailing slashes in bounded time', () => {
+    // A regex-based trailing-slash trim (`/\/+$/`) is polynomial-time here:
+    // a long run of `/` not at the true end forces backtracking at every
+    // position within the run. `endpoint` is caller-supplied configuration.
+    const adversarialEndpoint = `http://collector${'/'.repeat(200_000)}notaslash`;
+
+    const start = performance.now();
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', endpoint: adversarialEndpoint });
+    expect(performance.now() - start).toBeLessThan(100);
+    expect(resolved.traces.endpoint).toBe(`${adversarialEndpoint}/v1/traces`);
+  });
 });
 
 describe('security: malformed W3C trace context does not crash message processing', () => {
