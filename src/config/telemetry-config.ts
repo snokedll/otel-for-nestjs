@@ -107,8 +107,23 @@ const OTLP_PATH_BY_SIGNAL: Record<SignalName, string> = {
   metrics: '/v1/metrics',
 };
 
+const SLASH_CHAR_CODE = '/'.charCodeAt(0);
+
+/**
+ * Strips trailing `/` characters without a regex — `/\/+$/` is
+ * polynomial-time on adversarial input (many slashes followed by a
+ * non-slash character forces backtracking at every one of those
+ * positions). `endpoint` ultimately traces back to caller-supplied
+ * `TelemetryConfig`, so this is written to stay linear regardless.
+ */
+function stripTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === SLASH_CHAR_CODE) end -= 1;
+  return url.slice(0, end);
+}
+
 function appendOtlpPathIfMissing(url: string, otlpPath: string): string {
-  const trimmed = url.replace(/\/+$/, '');
+  const trimmed = stripTrailingSlashes(url);
   return trimmed.endsWith(otlpPath) ? trimmed : `${trimmed}${otlpPath}`;
 }
 

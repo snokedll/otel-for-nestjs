@@ -41,6 +41,35 @@ afterEach(() => {
 });
 
 describe('TraceLogger', () => {
+  describe('console level configuration', () => {
+    function lastPinoFactoryCallArgs() {
+      const factory = vi.mocked(pinoModule.default);
+      return factory.mock.calls[factory.mock.calls.length - 1][0] as { level: string };
+    }
+
+    it('defaults the console level to "info" when not provided', () => {
+      new TraceLogger();
+      expect(lastPinoFactoryCallArgs().level).toBe('info');
+    });
+
+    it('passes an explicit console level through to pino', () => {
+      new TraceLogger('MyService', 'debug');
+      expect(lastPinoFactoryCallArgs().level).toBe('debug');
+    });
+
+    it('does not read process.env.LOG_LEVEL', () => {
+      const original = process.env.LOG_LEVEL;
+      process.env.LOG_LEVEL = 'fatal';
+      try {
+        new TraceLogger();
+        expect(lastPinoFactoryCallArgs().level).toBe('info');
+      } finally {
+        if (original === undefined) delete process.env.LOG_LEVEL;
+        else process.env.LOG_LEVEL = original;
+      }
+    });
+  });
+
   describe('info / log', () => {
     it('writes to pino at info level with the trace id attached', () => {
       new TraceLogger('MyService').info('hello');

@@ -172,6 +172,17 @@ After this configuration, NestJS's default `Logger` is already
 correlated automatically, with no further changes needed in the
 application's services.
 
+`TraceLogger`'s constructor accepts two optional positional arguments:
+`context` (prefixed onto every log call unless overridden per-call) and
+`consoleLevel` (minimum level written to the console — `'debug' |
+'info' | 'warn' | 'error' | 'fatal'`, defaults to `'info'`). This only
+affects the console output; every call still emits a `LogRecord` via the
+OpenTelemetry Logs API regardless of `consoleLevel`.
+
+```typescript
+app.useLogger(new TraceLogger(undefined, 'debug'));
+```
+
 ### `@Span()` and `@Measure()` decorators
 
 ```typescript

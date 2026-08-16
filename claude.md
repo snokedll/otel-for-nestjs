@@ -707,6 +707,78 @@ entrada nova se descobrir algo que não estava documentado.
     using private name”) por referenciar um tipo não exportado numa
     interface pública.
 
+36. **Correções de achados do GitHub code scanning / socket.dev.** Cinco
+    itens reportados; dois eram vulnerabilidades reais e corrigidas, três
+    eram capacidades inerentes ao design ou dependências fora do nosso
+    controle, documentadas em vez de "corrigidas":
+
+    - **ReDoS polinomial real em `appendOtlpPathIfMissing()`
+      (`telemetry-config.ts`)**: `url.replace(/\/+$/, '')` trimava barras
+      finais de `endpoint` (config vinda do usuário) com um regex.
+      Confirmado empiricamente, não só pelo alerta: `'/'.repeat(200_000)`
+      seguido de qualquer caractere não-barra levou o regex a ~24.7
+      SEGUNDOS (uma corrida de barras que não termina exatamente no fim da
+      string força o motor a fazer backtrack em CADA posição dentro dela).
+      Fix: `stripTrailingSlashes()`, um loop manual O(n) sem regex nenhum —
+      mesmo comportamento, sem essa classe de vulnerabilidade. Teste de
+      segurança adicionado (`security.spec.ts`) provando tempo limitado
+      pra esse input adversarial específico.
+
+    - **`process.env.LOG_LEVEL` lido implicitamente em `trace-logger.ts`**:
+      Socket.dev sinaliza qualquer acesso a `process.env` como possível
+      indício de roubo de credencial — falso positivo aqui (só controlava
+      o nível de log do console), mas o acesso implícito a env var
+      também contradizia a própria filosofia da SDK pós-decisão 2 (uma
+      única fonte de configuração explícita, nada implícito via env var).
+      Fix que resolve as duas coisas de uma vez: `TraceLogger` ganhou um
+      segundo parâmetro posicional opcional, `consoleLevel` (default
+      `'info'`), mudança aditiva — `new TraceLogger()`/`new
+      TraceLogger('Ctx')` continuam funcionando sem alteração. `LOG_LEVEL`
+      não é mais lido em lugar nenhum do código.
+
+    - **`safe-buffer`/`readable-stream` (via cadeia transitiva de
+      `pino`/`pino-pretty`) sinalizados pelo "Socket Optimized Override"**:
+      não é uma vulnerabilidade (`safe-buffer` não tem CVE conhecido) — é
+      uma sugestão do PRODUTO do Socket.dev pra substituir por forks deles
+      próprios via `overrides`, o que trocaria confiança no mantenedor
+      original por confiança no registry deles; descartado por
+      desproporcional a um risco praticamente nulo. Em vez disso, resolvi
+      de verdade: `pino@8`→`^10.3.1` e `pino-pretty@10`→`^13.1.3`
+      eliminam `readable-stream` (e portanto `safe-buffer`) da árvore de
+      dependências inteira — confirmado via `npm ls safe-buffer` vazio
+      depois do bump. Validado com um smoke test real (não mockado) do
+      `pino({ transport: { target: 'pino-pretty' } })` — a suíte mocka
+      `pino` inteiro, então não pegaria uma quebra de runtime nessa major
+      bump sozinha.
+
+    - **`node:async_hooks` sinalizado como "debug, reflection e dynamic
+      code execution features" em `trace-context.js`**: capacidade
+      inerente ao design, não uma vulnerabilidade — `AsyncLocalStorage`
+      (`node:async_hooks`) é o mecanismo central de propagação de
+      trace/correlation-id por todo o request (`TraceContextManager`, ver
+      decisão original de arquitetura). Socket.dev classifica
+      `async_hooks` sob um rótulo genérico de "recursos avançados" junto
+      com `vm`/`Function` constructor — não há como remover sem quebrar a
+      SDK inteira. Nada foi alterado; é esperado que essa flag apareça em
+      qualquer allowlist/aceite de risco de quem rodar Socket.dev sobre
+      este pacote.
+
+    - **"Obfuscated code" em `@protobufjs/float`, `rimraf`, `strtok3`,
+      `yargs`**: nenhum dos quatro é dependência direta nossa —
+      `@protobufjs/float`/`yargs` vêm de `@opentelemetry/sdk-node` →
+      `@grpc/grpc-js` (código do exporter gRPC, que a SDK nem usa em
+      runtime — só os exporters HTTP/protobuf, ver decisão 1 — mas
+      `@opentelemetry/sdk-node` traz a dependência de qualquer jeito);
+      `rimraf` vem de `@opentelemetry/auto-instrumentations-node` →
+      detector de recurso GCP; `strtok3` vem de `@nestjs/common` →
+      `file-type` — ou seja, QUALQUER app NestJS 11 carrega essa cadeia,
+      independente desta SDK. Nenhum dos quatro tem CVE conhecido; são
+      pacotes estáveis, amplamente auditados, e "obfuscated" aqui quase
+      certamente é heurística batendo em código denso/bitwise legítimo
+      (`@protobufjs/float` faz codificação IEEE-754 manual, por exemplo).
+      Não há fix possível do nosso lado — dependência transitiva de
+      dependências que já estão na versão mais recente compatível.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver
