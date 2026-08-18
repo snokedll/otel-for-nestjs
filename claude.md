@@ -945,6 +945,34 @@ entrada nova se descobrir algo que não estava documentado.
     convenção de leitura agora, não porque uma ordem diferente quebraria
     algo.
 
+40. **`ContinueTraceOptions.extractCarrier` tinha que ser `(...args: any[])`,
+    não `(...args: unknown[])` — bug real de tipagem, reportado pelo
+    usuário usando a própria documentação da decisão 39/README ao pé da
+    letra.** `unknown[]` parecia a escolha "mais segura" (evita `any`
+    implícito) mas quebra o caso de uso inteiro: sob checagem contravariante
+    de parâmetros do TypeScript, `(job: Job<X>) => T` NÃO é atribuível a
+    `(...args: unknown[]) => T`, porque `unknown` não é atribuível a `Job<X>`
+    (o inverso de "qualquer coisa é atribuível a `unknown`") — exatamente o
+    erro "Types of parameters ... are incompatible" que o usuário viu. Ou
+    seja: TODO exemplo documentado com um `extractCarrier` tipado
+    (`(job: Job<...>) => job.data.trace`, decisão 39, README) simplesmente
+    não compilava — o bug estava nos PRÓPRIOS exemplos que eu escrevi.
+    Fix: trocar pra `(...args: any[]) => TraceCarrier | undefined`, mesma
+    convenção que o Nest usa em `FactoryProvider.useFactory`/`inject` pelo
+    mesmo motivo exato — o parâmetro é inerentemente "o que quer que o
+    consumidor declare", não dá pra tipar com segurança de antemão, e
+    `any[]` (ao contrário de `unknown[]`) é bidirecionalmente compatível
+    com qualquer assinatura de função concreta. Verificado contra o
+    `dist/index.d.ts` publicado de verdade (não só `src/`, já que
+    `tsconfig.json` raiz só cobre `src/` — `test/` não é type-checked por
+    `npm run build`/`tsc --noEmit`, só transpilado pelo esbuild do Vitest,
+    que não pega erro de tipo): um `.ts` isolado importando o pacote
+    buildado, com um `extractCarrier` tipado exatamente como o exemplo do
+    README, compilou limpo depois do fix. Testes do repositório também
+    limpos de casts `(job: unknown) => (job as {...})` que mascaravam esse
+    problema — agora usam interfaces tipadas de verdade, mesmo padrão dos
+    exemplos públicos.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver

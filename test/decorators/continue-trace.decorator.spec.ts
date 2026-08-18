@@ -90,8 +90,16 @@ describe('@ContinueTrace', () => {
     const remote = { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID, traceFlags: 1 };
     const capturedTrace = runWithRemoteParent(remote, () => captureTraceCarrier());
 
+    // A concretely-typed parameter here (not `unknown`/a cast) is the point of
+    // this test: ContinueTraceOptions.extractCarrier is typed with `any[]`
+    // specifically so a normally-typed function like this one is assignable
+    // to it — see claude.md for the regression this guards against.
+    interface Envelope {
+      payload: { trace: TraceCarrier };
+    }
+
     const wrapped = applyContinueTrace('activeTraceId', {
-      extractCarrier: (job: unknown) => (job as { payload: { trace: TraceCarrier } }).payload.trace,
+      extractCarrier: (job: Envelope) => job.payload.trace,
     });
 
     const observedTraceId = wrapped({ payload: { trace: capturedTrace } });
@@ -102,12 +110,18 @@ describe('@ContinueTrace', () => {
     const remote = { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID, traceFlags: 1 };
     const capturedTrace = runWithRemoteParent(remote, () => captureTraceCarrier());
 
-    // Mimics a Bull/BullMQ `Job` object: the enqueued payload lives at `.data`, not on the job itself.
+    // Mimics a Bull/BullMQ `Job<T>` type: the enqueued payload lives at
+    // `.data`, not on the job itself. Concretely typed, same reasoning as above.
+    interface Job<T> {
+      id: string;
+      data: T;
+    }
+
     const wrapped = applyContinueTrace('activeTraceId', {
-      extractCarrier: (job: unknown) => (job as { data: { trace: TraceCarrier } }).data.trace,
+      extractCarrier: (job: Job<{ invoiceId: string; trace: TraceCarrier }>) => job.data.trace,
     });
 
-    const fakeJob = { id: 'job-1', data: { invoiceId: 'inv_1', trace: capturedTrace } };
+    const fakeJob: Job<{ invoiceId: string; trace: TraceCarrier }> = { id: 'job-1', data: { invoiceId: 'inv_1', trace: capturedTrace } };
     expect(wrapped(fakeJob)).toBe(VALID_TRACE_ID);
   });
 
@@ -183,7 +197,12 @@ describe('@ContinueTrace', () => {
     it('honors a custom extractCarrier regardless of order', () => {
       const remote = { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID, traceFlags: 1 };
       const capturedTrace = runWithRemoteParent(remote, () => captureTraceCarrier());
-      const options: ContinueTraceOptions = { extractCarrier: (job: unknown) => (job as { data: { trace: TraceCarrier } }).data.trace };
+      interface Job<T> {
+        data: T;
+      }
+      const options: ContinueTraceOptions = {
+        extractCarrier: (job: Job<{ trace: TraceCarrier }>) => job.data.trace,
+      };
 
       const wrapped = applyBoth('span-then-continueTrace', options);
       expect(wrapped({ data: { trace: capturedTrace } })).toBe(VALID_TRACE_ID);
