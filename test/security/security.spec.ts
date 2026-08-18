@@ -5,7 +5,7 @@ import { metrics } from '@opentelemetry/api';
 import { HttpTraceInterceptor } from '../../src/interceptors/http-trace.interceptor';
 import { MessageTraceInterceptor } from '../../src/interceptors/message-trace.interceptor';
 import { resolveTelemetryConfig } from '../../src/config/telemetry-config';
-import { runWithTraceCarrier, type TraceCarrier } from '../../src/context/trace-carrier';
+import { resumeTraceCarrier, type TraceCarrier } from '../../src/context/trace-carrier';
 import { createFakeMeter } from '../support/otel-mocks';
 
 const meter = createFakeMeter();
@@ -190,19 +190,19 @@ describe('security: malformed trace carriers do not crash queue-side processing'
   ];
 
   it.each(malformedTraceparents)('runs fn without throwing for a malformed traceparent %j', (traceparent) => {
-    expect(runWithTraceCarrier({ traceparent }, () => 'ok')).toBe('ok');
+    expect(resumeTraceCarrier({ traceparent }, () => 'ok')).toBe('ok');
   });
 
   it('runs fn without throwing when the carrier itself is malformed (null/undefined/empty)', () => {
-    expect(runWithTraceCarrier(undefined, () => 'ok')).toBe('ok');
-    expect(runWithTraceCarrier({} as TraceCarrier, () => 'ok')).toBe('ok');
-    expect(runWithTraceCarrier(null as unknown as TraceCarrier, () => 'ok')).toBe('ok');
+    expect(resumeTraceCarrier(undefined, () => 'ok')).toBe('ok');
+    expect(resumeTraceCarrier({} as TraceCarrier, () => 'ok')).toBe('ok');
+    expect(resumeTraceCarrier(null as unknown as TraceCarrier, () => 'ok')).toBe('ok');
   });
 
   it('never pollutes Object.prototype from a __proto__-shaped carrier', () => {
     const maliciousCarrier = JSON.parse('{"__proto__":{"polluted":"yes"},"correlationId":"legit"}') as TraceCarrier;
 
-    runWithTraceCarrier(maliciousCarrier, () => 'ok');
+    resumeTraceCarrier(maliciousCarrier, () => 'ok');
 
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false);
@@ -212,7 +212,7 @@ describe('security: malformed trace carriers do not crash queue-side processing'
     const carrier: TraceCarrier = { correlationId: 'x'.repeat(1_000_000) };
 
     const start = performance.now();
-    runWithTraceCarrier(carrier, () => 'ok');
+    resumeTraceCarrier(carrier, () => 'ok');
     expect(performance.now() - start).toBeLessThan(100);
   });
 });

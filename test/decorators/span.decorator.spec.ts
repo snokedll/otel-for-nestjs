@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { Span, type SpanOptions } from '../../src/decorators/span.decorator';
+import { CORRELATION_ID_ATTRIBUTE, TraceContextManager } from '../../src/context/trace-context';
 import { createFakeTracer } from '../support/otel-mocks';
 
 function mockTracer() {
@@ -55,6 +56,21 @@ describe('@Span', () => {
     const tracer = mockTracer();
     applySpan('syncOk', { attributes: { 'app.kind': 'test' } })(1);
     expect(tracer.spans[0].attributes).toEqual({ 'app.kind': 'test' });
+  });
+
+  it('tags the span with app.correlation_id when a correlation id is active', () => {
+    const tracer = mockTracer();
+    const context = TraceContextManager.createContext({ correlationId: 'corr-span' });
+
+    TraceContextManager.run(context, () => applySpan('syncOk')(1));
+
+    expect(tracer.spans[0].attributes).toEqual(expect.objectContaining({ [CORRELATION_ID_ATTRIBUTE]: 'corr-span' }));
+  });
+
+  it('does not set app.correlation_id when no correlation id is active', () => {
+    const tracer = mockTracer();
+    applySpan('syncOk')(1);
+    expect(tracer.spans[0].attributes).not.toHaveProperty(CORRELATION_ID_ATTRIBUTE);
   });
 
   it('returns the original synchronous return value and ends the span OK', () => {

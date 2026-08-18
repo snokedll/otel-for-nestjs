@@ -1,9 +1,6 @@
-import { trace, SpanStatusCode, isSpanContextValid, type Attributes, type Span as OtelSpan } from '@opentelemetry/api';
+import { isSpanContextValid } from '@opentelemetry/api';
 import { extractW3CSpanContext, injectW3CTraceParent, runWithRemoteParent } from './w3c-propagation';
 import { TraceContextManager } from './trace-context';
-import { settleSyncOrAsync } from '../decorators/settle-sync-or-async';
-
-const TRACER_NAME = '@snokedll/otel-for-nestjs';
 
 /**
  * Serializable snapshot of the trace/correlation identifiers in flight at
@@ -21,31 +18,6 @@ export interface TraceCarrier {
   tracestate?: string;
   /** Business correlation identifier active at capture time, if any. */
   correlationId?: string;
-}
-
-/**
- * Options accepted by {@link runWithTraceCarrier} — an internal building
- * block for `@ContinueTrace()`, not part of the SDK's public API (not
- * re-exported from the package root).
- */
-export interface RunWithTraceCarrierOptions {
-  /** Span name for the processing unit. Defaults to `'async.process'`. */
-  spanName?: string;
-  /** Extra attributes recorded on the processing span. */
-  attributes?: Attributes;
-}
-
-function finishOk(span: OtelSpan, value: unknown): unknown {
-  span.setStatus({ code: SpanStatusCode.OK });
-  span.end();
-  return value;
-}
-
-function finishError(span: OtelSpan, error: unknown): never {
-  span.recordException(error as Error);
-  span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error)?.message });
-  span.end();
-  throw error;
 }
 
 /**
@@ -80,20 +52,22 @@ export function captureTraceCarrier(): TraceCarrier {
 }
 
 /**
- * Runs `fn` as a new span, directly linked to whatever trace was active
- * when `carrier` was captured — the SAME trace id flows through, whether
- * the gap in between was a Bull/BullMQ job, a RabbitMQ/Kafka message, or a
- * plain `setTimeout`/`setInterval` callback.
+ * Runs `fn` with the trace/correlation context active when `carrier` was
+ * captured resumed — the SAME trace id flows through, whether the gap in
+ * between was a Bull/BullMQ job, a RabbitMQ/Kafka message, or a plain
+ * `setTimeout`/`setInterval` callback.
+ *
+ * Deliberately does not create a span of its own — resuming a trace and
+ * naming a span are two different concerns (the same split as `@Span()`
+ * vs `@Measure()`). Pair this with `@Span()` (or a manual
+ * `tracer.startActiveSpan()`) to get a visible, named span for the
+ * resumed work; without one, the resumed trace/correlation-id still shows
+ * up in logs and in any further auto-instrumented call made from within
+ * `fn`, just without a span of its own marking the processing unit.
  *
  * Not part of the SDK's public API — it is the mechanism `@ContinueTrace()`
  * wraps for consumer-side methods, and is not re-exported from the package
  * root. Use `@ContinueTrace()` instead.
- *
- * `fn`'s own trace/correlation context (readable via `TraceContextManager`,
- * and used automatically by `TraceLogger`) is set up before it runs, so
- * logs emitted from within `fn` carry the original trace id too — this is
- * the mechanism that gives an async worker a direct, provable link back to
- * the request/event that scheduled it, regardless of the queue technology.
  *
  * When `carrier` is `undefined` or carries no valid `traceparent` (never
  * captured, corrupted in transit, or the job predates this feature), `fn`
@@ -102,24 +76,17 @@ export function captureTraceCarrier(): TraceCarrier {
  *
  * @param carrier the value produced by {@link captureTraceCarrier} at enqueue time.
  * @param fn the operation to run (sync or async).
- * @param options span name/attributes for the processing unit.
  * @returns whatever `fn` returns, preserving sync-vs-`Promise` shape.
  */
-export function runWithTraceCarrier<T>(carrier: TraceCarrier | undefined, fn: () => T, options?: RunWithTraceCarrierOptions): T {
+export function resumeTraceCarrier<T>(carrier: TraceCarrier | undefined, fn: () => T): T {
   const remoteParent = carrier?.traceparent
     ? extractW3CSpanContext({ traceparent: carrier.traceparent, tracestate: carrier.tracestate })
     : undefined;
 
-  const runInstrumented = (): T =>
-    trace.getTracer(TRACER_NAME).startActiveSpan(options?.spanName ?? 'async.process', { attributes: options?.attributes }, (span) => {
-      const traceContext = TraceContextManager.createContext({ correlationId: carrier?.correlationId });
+  const runInContext = (): T => {
+    const traceContext = TraceContextManager.createContext({ correlationId: carrier?.correlationId });
+    return TraceContextManager.run(traceContext, fn);
+  };
 
-      return settleSyncOrAsync(
-        () => TraceContextManager.run(traceContext, fn),
-        (value) => finishOk(span, value),
-        (error) => finishError(span, error),
-      ) as T;
-    });
-
-  return remoteParent && isSpanContextValid(remoteParent) ? runWithRemoteParent(remoteParent, runInstrumented) : runInstrumented();
+  return remoteParent && isSpanContextValid(remoteParent) ? runWithRemoteParent(remoteParent, runInContext) : runInContext();
 }

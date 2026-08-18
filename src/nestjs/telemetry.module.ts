@@ -23,6 +23,13 @@ import { TELEMETRY_CONFIG } from './telemetry.tokens';
  * HTTP server is created, before any Kafka client connects. That is early
  * enough for every OTel JS instrumentation this SDK ships with.
  *
+ * There is deliberately no `forRootAsync()` — see claude.md, decision 37,
+ * for why a DI-resolved (`useFactory`/`inject`) config source is
+ * fundamentally incompatible with the guarantee above, confirmed by direct
+ * reproduction (Node core module instrumentation, `http` included, does
+ * not retroactively patch a module already `require()`d before
+ * `NodeSDK.start()` runs — unlike most userland instrumentations).
+ *
  * @example
  * ```ts
  * // telemetry.config.ts

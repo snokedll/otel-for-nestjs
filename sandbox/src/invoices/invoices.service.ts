@@ -110,8 +110,9 @@ export class InvoicesService {
    * o "gap" — na prática seria um `queue.add()` do Bull/BullMQ, um
    * `publish` no RabbitMQ, um `producer.send()` no Kafka, etc. O trace é
    * capturado aqui, ainda dentro da requisição, e passado como parte do
-   * job pra `processDelayedJob` — o `@ContinueTrace()` naquele método
-   * cuida do resto.
+   * job pra `processDelayedJob` — `@ContinueTrace()` retoma o trace
+   * capturado e `@Span()` cria o span nomeado já como filho do trace
+   * retomado, em qualquer ordem entre os dois (ver README).
    */
   scheduleDelayedProcessing(id: string, delayMs = 1000): void {
     const job: DelayedProcessingJob = { invoiceId: id, trace: captureTraceCarrier() };
@@ -124,7 +125,8 @@ export class InvoicesService {
     }, delayMs);
   }
 
-  @ContinueTrace('invoice.delayed-processing')
+  @ContinueTrace()
+  @Span('invoice.delayed-processing')
   private async processDelayedJob({ invoiceId }: DelayedProcessingJob): Promise<void> {
     this.logger.log('Processamento assíncrono iniciado (mesmo trace da requisição original)', { invoiceId });
     await this.process(invoiceId);
