@@ -779,6 +779,172 @@ entrada nova se descobrir algo que não estava documentado.
       Não há fix possível do nosso lado — dependência transitiva de
       dependências que já estão na versão mais recente compatível.
 
+37. **`TelemetryModule` não tem `forRootAsync()` — tentado, implementado,
+    testado empiricamente, e revertido depois de achar um bug sério, não
+    hipotético.** Pergunta original do usuário: por que não suportar
+    `useFactory`/`inject` como `ConfigModule`/`TypeOrmModule` fazem, pra
+    valores que só um serviço de configuração assíncrono consegue prover?
+
+    **Primeira análise (incompleta, corrigida abaixo):** um `forRootAsync()`
+    resolveria através do container de DI, que só existe DENTRO de
+    `NestFactory.create()`. Achei, por dedução, que o risco seria estreito:
+    "só" providers que fazem I/O instrumentável no próprio bootstrap
+    (construtor, `onModuleInit`) e que o Nest resolva antes do nosso
+    factory (Nest não garante ordem entre módulos) ficariam sem trace —
+    tráfego real de request, raciocinei, estaria seguro, porque por
+    definição só começa a fluir depois que TODO o DI (incluindo nosso
+    factory) já terminou. Testei separadamente (via `import()` dinâmico em
+    `main.ts`, adiando TODOS os imports — não só os do Nest — pra depois de
+    um `await` simulando um secrets manager) que dá pra ter config
+    assíncrona SEM DI nenhum, preservando cobertura total de
+    auto-instrumentação (HTTP, Express, Kafka) — isso está correto e seguia
+    documentado no README ("Sourcing configuration asynchronously").
+
+    **O usuário pediu pra implementar `forRootAsync()` mesmo assim.**
+    Implementei (`useFactory`/`inject`/`imports`, convenção padrão do
+    ecossistema Nest, com `TELEMETRY_CONFIG` como provider `useFactory`
+    assíncrono chamando `initializeTelemetry()` só depois de resolver o
+    config) e testei end-to-end no sandbox, exatamente como decisão 31 e o
+    parágrafo acima — mesmo padrão de rigor. **O resultado contradisse a
+    primeira análise por completo**: `POST /invoices` e `GET /health`
+    pararam de gerar QUALQUER span de `@opentelemetry/instrumentation-http`/
+    `-express`/`-router` — não em casos raros de corrida entre providers,
+    em TODA requisição HTTP, sempre, de forma 100% reprodutível. Kafka e
+    spans manuais (`@Span`) continuaram funcionando normalmente.
+
+    Isolei a causa fora do Nest/sandbox pra confirmar o mecanismo exato:
+
+    ```js
+    // FALHA: require('http') acontece ANTES de sdk.start(), mesmo só ~300ms antes
+    const http = require('http');
+    await sleep(300);
+    /* getNodeAutoInstrumentations() + sdk.start() */
+    const server = http.createServer(...); // nenhum span gerado, nunca
+
+    // FUNCIONA: primeiro require('http') só depois de sdk.start()
+    await sleep(300);
+    /* getNodeAutoInstrumentations() + sdk.start() */
+    const http = require('http'); // spans gerados normalmente
+    ```
+
+    Confirmado lendo o source de `@opentelemetry/instrumentation-http`:
+    o patch é sim em `Server.prototype.emit` (protótipo compartilhado,
+    não uma instância) — a decisão 31 estava certa sobre ISSO. O que a
+    decisão 31 não tinha testado (porque nesse teste `http` nunca tinha
+    sido `require`'d por ninguém antes) é que o MECANISMO de hook pra
+    módulos NATIVOS do Node (`http`, `https`, ...) aparentemente não
+    re-intercepta um módulo cujo require já aconteceu antes do SDK
+    registrar as instrumentações — diferente de módulos userland como
+    `kafkajs`, que continuaram funcionando mesmo `require`'dos antes.
+    `NestFactory.create()` cria o adapter Express (e portanto `require('http')`)
+    bem no início da própria execução — ou seja, ANTES do container de DI
+    resolver nosso factory assíncrono, em qualquer app real. Não é uma
+    condição de corrida rara: é garantido acontecer sempre que
+    `forRootAsync()` é usado.
+
+    Revertido por completo (`forRootAsync`/`TelemetryModuleAsyncOptions`
+    removidos de `telemetry.module.ts`/`index.ts`, testes removidos,
+    `sandbox/` restaurada). `TelemetryModule.forRoot()` continua sendo a
+    única API. Pra configuração de fontes assíncronas, a resposta certa
+    continua sendo o padrão de `import()` dinâmico (parágrafo anterior,
+    README) — que nunca sofre desse problema porque `http` também não é
+    `require`'do até depois do `await`, exatamente como o `forRoot()`
+    síncrono original. Lição maior, reforçando a decisão 31: "prototype
+    patching sobrevive a require tardio" não é uma regra universal do OTel
+    JS — vale para a maioria dos módulos userland testados até agora, mas
+    não necessariamente para módulos nativos do Node. Não generalizar sem
+    testar de novo, pra cada mecanismo de instrumentação novo.
+
+38. **`@ContinueTrace()` parou de criar span próprio — passou a fazer só
+    retomada de contexto, exatamente como `runWithRemoteParent()`/
+    `TraceContextManager` fazem pros outros sinais.** Crítica do usuário,
+    correta: por que `ContinueTraceOptions` tinha `spanName`/`attributes`
+    se `@Span()` já existe pra isso? Ele já combinava os dois no mesmo
+    método (`@Span` + `@ContinueTrace`) e isso gerava DOIS spans
+    desconectados — o de `@Span()` (filho de qualquer contexto que
+    estivesse ativo ANTES do método rodar, tipicamente nenhum) e o de
+    `@ContinueTrace()` (filho do trace remoto capturado, criado
+    INTERNAMENTE por `runWithTraceCarrier()` depois de `@ContinueTrace()`
+    já ter re-parentado o contexto ativo) — duas árvores de trace
+    separadas pra uma única chamada de método, exatamente a "interferência"
+    que o usuário suspeitava.
+
+    Fix: `runWithTraceCarrier()` (que criava span, decisão 30) virou
+    `resumeTraceCarrier()` — só re-parenta o contexto OTel ativo
+    (`runWithRemoteParent`) e o `TraceContextManager` (trace id/correlation
+    id), sem chamar `tracer.startActiveSpan()` nenhuma vez. `@ContinueTrace()`
+    ficou só com `extractCarrier` em `ContinueTraceOptions` — `spanName`/
+    `attributes` saíram, porque a responsabilidade de nomear/anotar um span
+    é do `@Span()`. Documentado que a ordem de composição importa:
+    `@ContinueTrace()` PRECISA vir ACIMA de `@Span()` (executa primeiro,
+    decorators aplicam de baixo pra cima — o de baixo vira o wrapper mais
+    interno), pra que o span do `@Span()` já nasça filho do trace
+    retomado, não da raiz.
+
+    Efeito colateral que precisou de correção pra não regredir a decisão
+    29: o atributo `app.correlation_id` só era marcado por
+    `TraceContextManager.createContext()` no span ATIVO no momento da
+    chamada — que, sem `@ContinueTrace()` criar mais um span, é um
+    `NonRecordingSpan` (placeholder do `runWithRemoteParent`), onde
+    `setAttribute()` é no-op. Sem ajuste, o correlation-id nunca chegaria
+    no span de verdade criado depois pelo `@Span()`. Fix (também corrige
+    uma lacuna pré-existente, não só do `@ContinueTrace()`): `@Span()`
+    agora também marca `app.correlation_id` no PRÓPRIO span que cria,
+    lendo `TraceContextManager.getCorrelationId()` — antes disso, um
+    `@Span()` aninhado dentro de uma requisição HTTP (ex.: `invoice.fraud-check`
+    dentro de `invoice.process-payment`) nunca recebia esse atributo, só o
+    span raiz da requisição (marcado uma vez pelo interceptor). Agora
+    qualquer span criado por `@Span()` carrega o correlation-id ativo,
+    dentro ou fora de `@ContinueTrace()`.
+
+39. **`@ContinueTrace()` + `@Span()` funcionam em QUALQUER ordem — não é
+    mais preciso decorar `@ContinueTrace()` acima de `@Span()`.** Pedido do
+    usuário, direto: "todos os nossos decorators não deve ter restrição de
+    ordem" — mesmo princípio já estabelecido antes pra `@Span`/`@Get()`
+    (decisão sobre `copyMethodMetadata`/`preserveFunctionName`), agora
+    estendido pra composição ENTRE decorators desta SDK, não só com os do
+    Nest. A decisão 38 introduziu a exigência de ordem (`@ContinueTrace()`
+    precisa vir acima, senão `@Span()` cria o span ANTES do trace ser
+    retomado, virando raiz de uma árvore desconexa) — o usuário rejeitou
+    isso como a mesma classe de amadorismo já corrigida antes.
+
+    Fix: mecanismo de coordenação via `reflect-metadata`, simétrico ao que
+    já existe pra sobreviver a wrapping (`copyMethodMetadata`), mas usado
+    aqui pra COMUNICAÇÃO entre decorators, não só preservação. `@ContinueTrace()`
+    marca a função que produz com uma chave de metadata própria (símbolo
+    não exportado) guardando seu `extractCarrier` resolvido. `@Span()`, ao
+    aplicar, verifica essa metadata na função que está envolvendo — se
+    presente (`@ContinueTrace()` em QUALQUER posição da pilha, direta ou
+    atrás de outro decorator como `@Measure()`, já que `copyMethodMetadata`
+    propaga toda chave de metadata genericamente, não só as do Nest), `@Span()`
+    envolve sua PRÓPRIA lógica de criação de span dentro de um
+    `resumeTraceCarrier()`, extraindo o carrier via a função guardada,
+    ANTES de chamar `tracer.startActiveSpan()`. Efeito: não importa se
+    `@ContinueTrace()` é o wrapper mais externo (já funcionava antes, sem
+    mudança) ou o mais interno (agora corrigido) — o span do `@Span()`
+    sempre nasce filho do trace retomado.
+
+    Efeito colateral aceito conscientemente quando `@Span()` é o wrapper
+    externo: a retomada de contexto acontece DUAS vezes (uma pelo `@Span()`,
+    envolvendo a criação do span; outra pelo `@ContinueTrace()` original,
+    ao ser chamado por dentro) — redundante mas inofensivo
+    (`resumeTraceCarrier()` é idempotente: re-parentar pro mesmo contexto
+    remoto, ou marcar o mesmo correlation-id de novo no mesmo span, não tem
+    efeito colateral observável). Preferido a "desembrulhar" o método
+    original pra evitar a duplicata, que exigiria expor o método cru via
+    metadata também — complexidade desproporcional ao ganho.
+
+    Validado empiricamente na sandbox (não só nos testes unitários — mesmo
+    padrão de rigor das decisões 31/37): inverti a ordem de
+    `InvoicesService.processDelayedJob` pra `@Span()` acima de
+    `@ContinueTrace()` (a ordem antes quebrada) e confirmei via Tempo real
+    que `invoice.delayed-processing` continua filho do mesmo trace que
+    `invoice.process-payment` (mesmo `parentSpanId` do span raiz da
+    requisição HTTP), com `app.correlation_id` presente — revertido depois
+    do teste, sandbox usa a ordem `@ContinueTrace()`/`@Span()` só por
+    convenção de leitura agora, não porque uma ordem diferente quebraria
+    algo.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver

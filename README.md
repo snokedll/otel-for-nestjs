@@ -116,6 +116,61 @@ required.
 | `ignoreRoutes` | `RoutePattern[]` (`string \| RegExp`) | `[]` | HTTP routes for which no trace, correlation-id, or metric is generated. |
 | `ignoreEvents` | `EventIgnoreRule[]` | `[]` | Consumed events, identified by partial match on the message body and/or headers, for which no trace, correlation-id, or metric is generated. |
 
+### Sourcing configuration asynchronously
+
+`TelemetryModule` exposes `forRoot()` only, not a DI-based `forRootAsync()`.
+`TelemetryModule.forRoot()` initializes the OpenTelemetry SDK synchronously,
+at the moment `AppModule`'s `@Module()` decorator is evaluated — before
+`NestFactory.create()` runs, before `http`/`express` are ever imported.
+That ordering is required, not just preferred: Node core-module
+instrumentation (`http` included) does not retroactively patch a module
+that was already `require()`d before the SDK starts. Since
+`NestFactory.create()` imports `http`/`express` internally, near the very
+start of its own execution, a `forRootAsync()` resolving through Nest's
+dependency injection container (`useFactory`/`inject`) would always run
+too late — this was implemented and verified empirically: every HTTP
+request went completely untraced, consistently, not as an edge case.
+
+If a value must come from an asynchronous source (a secrets manager, a
+remote config service), resolve it in `main.ts` before anything
+NestJS/OpenTelemetry-related is imported, then load the application with
+a dynamic `import()`:
+
+```typescript
+// main.ts
+import 'reflect-metadata';
+
+async function bootstrap(): Promise<void> {
+  const secrets = await fetchConfigFromVault(); // the only async work; nothing else has been imported yet
+
+  const { setTelemetryConfig } = await import('./telemetry.config');
+  setTelemetryConfig({ serviceName: secrets.serviceName, endpoint: secrets.otelEndpoint });
+
+  const { AppModule } = await import('./app.module'); // first import of anything Nest/OTel-related
+  const { NestFactory } = await import('@nestjs/core');
+
+  const app = await NestFactory.create(AppModule);
+  await app.listen(3000);
+}
+
+void bootstrap();
+```
+
+```typescript
+// telemetry.config.ts
+import type { TelemetryConfig } from '@snokedll/otel-for-nestjs';
+
+export let telemetryConfig: TelemetryConfig;
+
+export function setTelemetryConfig(config: TelemetryConfig): void {
+  telemetryConfig = config;
+}
+```
+
+This preserves the ordering guarantee in full — nothing instrumented is
+imported until after the asynchronous resolution completes — without
+involving Nest's DI container at all.
+
 ### Correlation-id source
 
 `correlationIdSources` is evaluated in order; the first non-empty value
@@ -224,7 +279,7 @@ whenever a correlation-id is resolved, enabling search via TraceQL:
 ### Trace continuity across asynchronous processing
 
 ```typescript
-import { captureTraceCarrier, ContinueTrace, type TraceCarrier } from '@snokedll/otel-for-nestjs';
+import { captureTraceCarrier, ContinueTrace, Span, type TraceCarrier } from '@snokedll/otel-for-nestjs';
 
 // At the point where asynchronous processing is scheduled
 const trace = captureTraceCarrier();
@@ -234,7 +289,8 @@ await queue.add('charge-invoice', { invoiceId, trace });
 ```typescript
 // On the processing consumer
 class InvoiceProcessor {
-  @ContinueTrace('invoice.charge')
+  @ContinueTrace()
+  @Span('invoice.charge')
   async process(job: { invoiceId: string; trace: TraceCarrier }) {
     // runs with the same trace-id and correlation-id as the original request
   }
@@ -243,9 +299,69 @@ class InvoiceProcessor {
 
 `captureTraceCarrier()` returns a plain, serializable object, meant to be
 included in the job payload — independent of the queue technology used
-(Bull, RabbitMQ, Kafka, scheduling, etc.). `@ContinueTrace()` reads the
-`trace` field off the method's first argument by default; the
-`extractCarrier` option allows for a different payload shape.
+(Bull, RabbitMQ, Kafka, scheduling, etc.).
+
+`@ContinueTrace()` only resumes trace/correlation-id context — it never
+creates a span of its own. Naming a span is `@Span()`'s job, the same
+separation already used for `@Span()`/`@Measure()`. Stack them together to
+get a visible, named span for the resumed processing unit — **in either
+order**: `@Span()` always ends up parented to the resumed trace regardless
+of which of the two is declared first, the same way no other decorator
+pair in this SDK requires a specific order. Using `@ContinueTrace()` alone
+is valid too — logs and any further auto-instrumented call made from
+within the method (an HTTP request, a DB query, another publish) still
+correctly attach to the resumed trace; only a span marking the processing
+unit itself is missing.
+
+#### `ContinueTraceOptions`
+
+| Field | Type | Description |
+|---|---|---|
+| `extractCarrier` | `(...args: unknown[]) => TraceCarrier \| undefined` | Reads the `TraceCarrier` off the decorated method's own arguments. Defaults to `args[0].trace`. |
+
+`extractCarrier`'s default (`args[0].trace`) matches a processor that
+receives the enqueued payload directly as its first argument — RabbitMQ
+consumers, `@nestjs/microservices` custom transports, a raw `setTimeout`
+callback. **Bull and BullMQ processors do not match this shape**: their
+first argument is a `Job` wrapper, and the enqueued payload — the carrier
+included — lives one level deeper, at `job.data`. Override `extractCarrier`
+in that case:
+
+```typescript
+// Enqueue side (Bull/BullMQ) — trace is just another field in the job's data
+await queue.add('charge-invoice', { invoiceId, trace: captureTraceCarrier() });
+```
+
+```typescript
+// Bull (@nestjs/bull) processor
+import { Processor, Process } from '@nestjs/bull';
+import type { Job } from 'bull';
+
+@Processor('invoices')
+class InvoiceProcessor {
+  @Process('charge-invoice')
+  @ContinueTrace({
+    extractCarrier: (job: Job<{ invoiceId: string; trace: TraceCarrier }>) => job.data.trace,
+  })
+  @Span('invoice.charge')
+  async handleCharge(job: Job<{ invoiceId: string; trace: TraceCarrier }>) {
+    // job.data.invoiceId, resumed into the original trace
+  }
+}
+```
+
+```typescript
+// BullMQ (@nestjs/bullmq) WorkerHost — same Job.data shape
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import type { Job } from 'bullmq';
+
+@Processor('invoices')
+class InvoiceProcessor extends WorkerHost {
+  @ContinueTrace({ extractCarrier: (job: Job) => job.data.trace })
+  @Span('invoice.charge')
+  async process(job: Job<{ invoiceId: string; trace: TraceCarrier }>) { ... }
+}
+```
 
 ### Consuming events
 

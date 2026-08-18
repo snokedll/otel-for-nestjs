@@ -1,22 +1,83 @@
-import type { Attributes } from '@opentelemetry/api';
 import type { TraceCarrier } from '../context/trace-carrier';
-import { runWithTraceCarrier } from '../context/trace-carrier';
-import { assertStringPropertyKey, preserveFunctionName, resolveDefaultName } from './decorator-utils';
+import { resumeTraceCarrier } from '../context/trace-carrier';
+import { assertStringPropertyKey, preserveFunctionName } from './decorator-utils';
 import { copyMethodMetadata } from './copy-method-metadata';
 
 export interface ContinueTraceOptions {
-  /** Span name for the processing unit. Defaults to `ClassName.methodName`. */
-  spanName?: string;
-  /** Extra attributes recorded on the processing span. */
-  attributes?: Attributes;
   /**
    * Reads the `TraceCarrier` captured at enqueue time off the decorated
-   * method's own arguments. Defaults to reading a `trace` property off the
-   * first argument (`args[0].trace`) — the shape `captureTraceCarrier()` is
-   * meant to be spread into. Override for a different payload shape (e.g.
-   * a differently named field, or a carrier nested deeper in the payload).
+   * method's own arguments.
+   *
+   * Defaults to reading a `trace` property off the first argument
+   * (`args[0].trace`) — the shape a plain `queue.add('name', { ...payload,
+   * trace: captureTraceCarrier() })` call produces, where the processor
+   * receives that payload object directly as its first parameter (RabbitMQ
+   * consumers, `@nestjs/microservices` custom transports, a raw
+   * `setTimeout` callback, ...).
+   *
+   * Override this whenever the carrier is NOT at `args[0].trace` — the
+   * most common case being **Bull/BullMQ**, where a processor's first
+   * argument is a `Job` wrapper, not the payload itself: the payload (and
+   * therefore the carrier) lives one level deeper, at `job.data`.
+   *
+   * @example
+   * ```ts
+   * // Enqueue side (Bull/BullMQ) — trace lives inside the job's data, like any other field:
+   * await queue.add('charge-invoice', { invoiceId, trace: captureTraceCarrier() });
+   * ```
+   * ```ts
+   * // Bull (`@nestjs/bull`) processor — Job.data holds what was enqueued above:
+   * import { Processor, Process } from '@nestjs/bull';
+   * import type { Job } from 'bull';
+   *
+   * @Processor('invoices')
+   * class InvoiceProcessor {
+   *   @Process('charge-invoice')
+   *   @Span('invoice.charge')
+   *   @ContinueTrace({
+   *     extractCarrier: (job: Job<{ invoiceId: string; trace: TraceCarrier }>) => job.data.trace,
+   *   })
+   *   async handleCharge(job: Job<{ invoiceId: string; trace: TraceCarrier }>) {
+   *     // job.data.invoiceId, resumed into the original trace
+   *   }
+   * }
+   * ```
    */
   extractCarrier?: (...args: unknown[]) => TraceCarrier | undefined;
+}
+
+type ExtractCarrierFn = (...args: unknown[]) => TraceCarrier | undefined;
+
+interface MetadataReflect {
+  getMetadata?(metadataKey: unknown, target: object): unknown;
+  defineMetadata?(metadataKey: unknown, metadataValue: unknown, target: object): void;
+}
+
+/**
+ * Not a public export — `reflect-metadata` key `@Span()` looks up (via
+ * {@link getContinueTraceExtractCarrier}) to detect that a method also
+ * carries `@ContinueTrace()`, regardless of which of the two was applied
+ * first. `copyMethodMetadata` (used by every method decorator in this SDK)
+ * copies this key like any other, so it survives being wrapped further —
+ * by `@Measure()` sitting between the two, for instance.
+ */
+const CONTINUE_TRACE_EXTRACT_CARRIER = Symbol('otel-for-nestjs:continueTraceExtractCarrier');
+
+function markContinueTrace(target: object, extractCarrier: ExtractCarrierFn): void {
+  const reflect = Reflect as typeof Reflect & MetadataReflect;
+  reflect.defineMetadata?.(CONTINUE_TRACE_EXTRACT_CARRIER, extractCarrier, target);
+}
+
+/**
+ * @returns the `extractCarrier` function a `@ContinueTrace()` elsewhere in
+ * the decorator stack attached to `target`, if any. Used by `@Span()` to
+ * resume the trace before creating its own span even when `@ContinueTrace()`
+ * is the innermost (closest to the method) of the two.
+ */
+export function getContinueTraceExtractCarrier(target: object): ExtractCarrierFn | undefined {
+  const reflect = Reflect as typeof Reflect & MetadataReflect;
+  if (typeof reflect.getMetadata !== 'function') return undefined;
+  return reflect.getMetadata(CONTINUE_TRACE_EXTRACT_CARRIER, target) as ExtractCarrierFn | undefined;
 }
 
 function defaultExtractCarrier(...args: unknown[]): TraceCarrier | undefined {
@@ -24,49 +85,60 @@ function defaultExtractCarrier(...args: unknown[]): TraceCarrier | undefined {
   return first?.trace;
 }
 
-function resolveOptions(options?: ContinueTraceOptions | string): ContinueTraceOptions {
-  return typeof options === 'string' ? { spanName: options } : (options ?? {});
-}
-
 /**
  * Wraps a method (sync or async) so it runs resumed into whatever trace was
  * active when its caller captured a `TraceCarrier` via `captureTraceCarrier()`
- * — the ergonomic, queue-agnostic equivalent of `@Span()` for asynchronous
- * processing. The method body itself never touches `runWithTraceCarrier()`;
+ * — the queue-agnostic mechanism for trace continuity across asynchronous
+ * processing. The method body itself never touches trace-carrier internals;
  * decorating it is the whole integration.
  *
- * @param options a span name, or {@link ContinueTraceOptions}.
+ * Deliberately does only that — resuming trace/correlation-id context —
+ * and does not create a span of its own: naming a span is `@Span()`'s job,
+ * not this one, the same separation of concerns as `@Span()` vs
+ * `@Measure()`. Composes with `@Span()` in **either order** — same
+ * guarantee as every other decorator pair in this SDK. Whichever order you
+ * write them in, `@Span()`'s span always ends up parented to the resumed
+ * trace, never the other way around:
  *
- * @example
  * ```ts
  * class InvoiceProcessor {
- *   @ContinueTrace('invoice.charge')
- *   async process(job: { invoiceId: string; trace: TraceCarrier }) {
- *     // runs already resumed into the original trace
- *   }
+ *   @ContinueTrace()
+ *   @Span('invoice.charge')
+ *   async process(job: { invoiceId: string; trace: TraceCarrier }) { ... }
  * }
- *
- * // enqueue side, unchanged:
- * await queue.add('charge-invoice', { invoiceId, trace: captureTraceCarrier() });
  * ```
+ * ```ts
+ * class InvoiceProcessor {
+ *   @Span('invoice.charge')
+ *   @ContinueTrace()
+ *   async process(job: { invoiceId: string; trace: TraceCarrier }) { ... }
+ * }
+ * ```
+ *
+ * Using `@ContinueTrace()` alone (no `@Span()`) is valid — logs emitted
+ * from within the method, and any further auto-instrumented call it makes
+ * (an HTTP request, a DB query, another message publish), still correctly
+ * attach to the resumed trace. What is missing without `@Span()` is a span
+ * of the processing unit itself showing up in the trace.
+ *
+ * @param options see {@link ContinueTraceOptions}.
  */
-export function ContinueTrace(options?: ContinueTraceOptions | string): MethodDecorator {
-  const resolved = resolveOptions(options);
-  const extractCarrier = resolved.extractCarrier ?? defaultExtractCarrier;
+export function ContinueTrace(options?: ContinueTraceOptions): MethodDecorator {
+  const extractCarrier = options?.extractCarrier ?? defaultExtractCarrier;
 
-  return (target: object, propertyKey: string | symbol, descriptor: PropertyDescriptor): PropertyDescriptor => {
+  return (_target: object, propertyKey: string | symbol, descriptor: PropertyDescriptor): PropertyDescriptor => {
     assertStringPropertyKey(propertyKey, '@ContinueTrace');
 
     const originalMethod = descriptor.value as (...args: unknown[]) => unknown;
-    const spanName = resolved.spanName ?? resolveDefaultName(target, propertyKey);
 
     const wrapped = function (this: unknown, ...args: unknown[]): unknown {
       const carrier = extractCarrier(...args);
-      return runWithTraceCarrier(carrier, () => originalMethod.apply(this, args), { spanName, attributes: resolved.attributes });
+      return resumeTraceCarrier(carrier, () => originalMethod.apply(this, args));
     };
 
     copyMethodMetadata(originalMethod, wrapped);
     preserveFunctionName(originalMethod, wrapped);
+    markContinueTrace(wrapped, extractCarrier);
     descriptor.value = wrapped;
     return descriptor;
   };
