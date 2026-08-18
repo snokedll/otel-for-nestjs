@@ -8,6 +8,14 @@ export interface ContinueTraceOptions {
    * Reads the `TraceCarrier` captured at enqueue time off the decorated
    * method's own arguments.
    *
+   * Typed with `any[]`, not `unknown[]` — the parameter list of a job
+   * processor is whatever shape the caller's queue library defines (a
+   * `Job<T>`, a plain payload object, ...), and TypeScript would otherwise
+   * reject a normally-typed function here: `unknown` is not assignable to
+   * a specific parameter type, so `(job: Job<X>) => ...` would fail to
+   * satisfy `(...args: unknown[]) => ...`. Same reasoning NestJS itself
+   * uses for `FactoryProvider.useFactory`/`inject`.
+   *
    * Defaults to reading a `trace` property off the first argument
    * (`args[0].trace`) — the shape a plain `queue.add('name', { ...payload,
    * trace: captureTraceCarrier() })` call produces, where the processor
@@ -43,10 +51,10 @@ export interface ContinueTraceOptions {
    * }
    * ```
    */
-  extractCarrier?: (...args: unknown[]) => TraceCarrier | undefined;
+  extractCarrier?: (...args: any[]) => TraceCarrier | undefined;
 }
 
-type ExtractCarrierFn = (...args: unknown[]) => TraceCarrier | undefined;
+type ExtractCarrierFn = (...args: any[]) => TraceCarrier | undefined;
 
 interface MetadataReflect {
   getMetadata?(metadataKey: unknown, target: object): unknown;
@@ -80,7 +88,7 @@ export function getContinueTraceExtractCarrier(target: object): ExtractCarrierFn
   return reflect.getMetadata(CONTINUE_TRACE_EXTRACT_CARRIER, target) as ExtractCarrierFn | undefined;
 }
 
-function defaultExtractCarrier(...args: unknown[]): TraceCarrier | undefined {
+function defaultExtractCarrier(...args: any[]): TraceCarrier | undefined {
   const first = args[0] as { trace?: TraceCarrier } | undefined;
   return first?.trace;
 }

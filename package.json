@@ -1,6 +1,6 @@
 {
   "name": "@snokedll/otel-for-nestjs",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "OpenTelemetry abstraction SDK for NestJS",
   "license": "SEE LICENSE IN LICENSE",
   "author": "snokedll",
