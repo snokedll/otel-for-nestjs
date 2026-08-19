@@ -7,15 +7,18 @@ import { resolveTelemetryConfig } from '../../src/config/telemetry-config';
 import { CorrelationSource } from '../../src/context/correlation-id-extractor';
 import { createFakeMeter } from '../support/otel-mocks';
 
-// MetricsService caches instruments by name at module scope, so the meter
-// mock must be installed before the FIRST HttpTraceInterceptor is
-// constructed in this file — every instance afterwards resolves the same
-// cached counter/histogram regardless of which mock is active by then.
+// The meter mock only needs to be installed before the first request is
+// actually intercepted, not before HttpTraceInterceptor is constructed:
+// MetricsService.counter()/.histogram() defer resolving the underlying
+// instrument to the first .add()/.record() call, so the field initializers
+// below never touch the Metrics API themselves (see claude.md).
 const meter = createFakeMeter();
 vi.spyOn(metrics, 'getMeter').mockReturnValue(meter as never);
 
-const requestsCounter = () => meter.created['counter:http.server.requests'] as { add: ReturnType<typeof vi.fn> };
-const requestDuration = () => meter.created['histogram:http.server.request.duration'] as { record: ReturnType<typeof vi.fn> };
+// Undefined until the first request actually flows — that's when the
+// underlying instrument gets resolved and cached by name.
+const requestsCounter = () => meter.created['counter:http.server.requests'] as { add: ReturnType<typeof vi.fn> } | undefined;
+const requestDuration = () => meter.created['histogram:http.server.request.duration'] as { record: ReturnType<typeof vi.fn> } | undefined;
 
 function createHttpContext(overrides: {
   headers?: Record<string, string | string[] | undefined>;
@@ -54,13 +57,20 @@ function errorCallHandler(error: unknown): CallHandler {
 
 let interceptor: HttpTraceInterceptor;
 
-beforeAll(() => {
+beforeAll(async () => {
   interceptor = new HttpTraceInterceptor(resolveTelemetryConfig({ serviceName: 'svc' }));
+
+  // Warm up the deferred instruments once so every test can rely on
+  // requestsCounter()/requestDuration() already existing — the underlying
+  // instrument isn't resolved until the first real .add()/.record(), which
+  // only happens once a request actually flows through the interceptor.
+  const { context } = createHttpContext({});
+  await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'warmup')));
 });
 
 beforeEach(() => {
-  requestsCounter().add.mockClear();
-  requestDuration().record.mockClear();
+  requestsCounter()!.add.mockClear();
+  requestDuration()!.record.mockClear();
 });
 
 describe('HttpTraceInterceptor', () => {
@@ -80,7 +90,7 @@ describe('HttpTraceInterceptor', () => {
     await firstValueFrom(ignoringInterceptor.intercept(context, callHandlerFor(() => 'ok')));
 
     expect(setHeader).not.toHaveBeenCalled();
-    expect(requestsCounter().add).not.toHaveBeenCalled();
+    expect(requestsCounter()!.add).not.toHaveBeenCalled();
   });
 
   it('sets the x-trace-id response header on every non-ignored request', async () => {
@@ -145,7 +155,7 @@ describe('HttpTraceInterceptor', () => {
 
     await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    expect(requestsCounter().add).toHaveBeenCalledWith(1, { method: 'POST', route: 'InvoicesController.create', status_code: 201 });
+    expect(requestsCounter()!.add).toHaveBeenCalledWith(1, { method: 'POST', route: 'InvoicesController.create', status_code: 201 });
   });
 
   it('records status_code as the literal "error" when the downstream handler errors', async () => {
@@ -153,13 +163,13 @@ describe('HttpTraceInterceptor', () => {
 
     await expect(firstValueFrom(interceptor.intercept(context, errorCallHandler(new Error('boom'))))).rejects.toThrow('boom');
 
-    expect(requestsCounter().add).toHaveBeenCalledWith(1, expect.objectContaining({ status_code: 'error' }));
+    expect(requestsCounter()!.add).toHaveBeenCalledWith(1, expect.objectContaining({ status_code: 'error' }));
   });
 
   it('records a duration alongside the request count', async () => {
     const { context } = createHttpContext({});
     await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
-    expect(requestDuration().record).toHaveBeenCalledWith(expect.any(Number), expect.any(Object));
+    expect(requestDuration()!.record).toHaveBeenCalledWith(expect.any(Number), expect.any(Object));
   });
 
   it('never uses the raw URL as a metric attribute', async () => {
@@ -167,7 +177,7 @@ describe('HttpTraceInterceptor', () => {
 
     await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    const attributes = requestsCounter().add.mock.calls[0][1] as Record<string, unknown>;
+    const attributes = requestsCounter()!.add.mock.calls[0][1] as Record<string, unknown>;
     expect(Object.values(attributes)).not.toContain('/invoices/inv_7f2a9c');
   });
 });

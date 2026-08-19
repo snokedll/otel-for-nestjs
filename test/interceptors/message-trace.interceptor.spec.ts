@@ -8,12 +8,20 @@ import { CorrelationSource } from '../../src/context/correlation-id-extractor';
 import { TraceContextManager } from '../../src/context/trace-context';
 import { createFakeMeter } from '../support/otel-mocks';
 
+// The meter mock only needs to be installed before the first message is
+// actually intercepted, not before MessageTraceInterceptor is constructed:
+// MetricsService.counter()/.histogram() defer resolving the underlying
+// instrument to the first .add()/.record() call, so the field initializers
+// never touch the Metrics API themselves (see claude.md).
 const meter = createFakeMeter();
 vi.spyOn(metrics, 'getMeter').mockReturnValue(meter as never);
 
-const messagesCounter = () => meter.created['counter:messaging.kafka.messages_consumed'] as { add: ReturnType<typeof vi.fn> };
+// Undefined until the first message actually flows — that's when the
+// underlying instrument gets resolved and cached by name.
+const messagesCounter = () =>
+  meter.created['counter:messaging.kafka.messages_consumed'] as { add: ReturnType<typeof vi.fn> } | undefined;
 const processingDuration = () =>
-  meter.created['histogram:messaging.kafka.processing.duration'] as { record: ReturnType<typeof vi.fn> };
+  meter.created['histogram:messaging.kafka.processing.duration'] as { record: ReturnType<typeof vi.fn> } | undefined;
 
 const VALID_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
 const VALID_SPAN_ID = '00f067aa0ba902b7';
@@ -60,13 +68,21 @@ function errorCallHandler(error: unknown): CallHandler {
 
 let interceptor: MessageTraceInterceptor;
 
-beforeAll(() => {
+beforeAll(async () => {
   interceptor = new MessageTraceInterceptor(resolveTelemetryConfig({ serviceName: 'svc' }));
+
+  // Warm up the deferred instruments once so every test can rely on
+  // messagesCounter()/processingDuration() already existing — the
+  // underlying instrument isn't resolved until the first real
+  // .add()/.record(), which only happens once a message actually flows
+  // through the interceptor.
+  const { context } = createRpcContext({});
+  await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'warmup')));
 });
 
 beforeEach(() => {
-  messagesCounter().add.mockClear();
-  processingDuration().record.mockClear();
+  messagesCounter()!.add.mockClear();
+  processingDuration()!.record.mockClear();
 });
 
 describe('MessageTraceInterceptor', () => {
@@ -74,7 +90,7 @@ describe('MessageTraceInterceptor', () => {
     const { context } = createRpcContext({ type: 'http' });
     const result = await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'value')));
     expect(result).toBe('value');
-    expect(messagesCounter().add).not.toHaveBeenCalled();
+    expect(messagesCounter()!.add).not.toHaveBeenCalled();
   });
 
   it('bypasses instrumentation entirely for an ignored event', async () => {
@@ -85,7 +101,7 @@ describe('MessageTraceInterceptor', () => {
 
     await firstValueFrom(ignoringInterceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    expect(messagesCounter().add).not.toHaveBeenCalled();
+    expect(messagesCounter()!.add).not.toHaveBeenCalled();
   });
 
   it('still processes a non-matching event normally', async () => {
@@ -96,7 +112,7 @@ describe('MessageTraceInterceptor', () => {
 
     await firstValueFrom(ignoringInterceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    expect(messagesCounter().add).toHaveBeenCalled();
+    expect(messagesCounter()!.add).toHaveBeenCalled();
   });
 
   function correlationCapturingHandler(capture: { correlationId?: string }): CallHandler {
@@ -184,8 +200,8 @@ describe('MessageTraceInterceptor', () => {
 
     await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    expect(messagesCounter().add).toHaveBeenCalledWith(1, { topic: 'invoice.created', partition: 2, outcome: 'success' });
-    expect(processingDuration().record).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({ outcome: 'success' }));
+    expect(messagesCounter()!.add).toHaveBeenCalledWith(1, { topic: 'invoice.created', partition: 2, outcome: 'success' });
+    expect(processingDuration()!.record).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({ outcome: 'success' }));
   });
 
   it('records an error outcome and rethrows when the handler errors', async () => {
@@ -194,7 +210,7 @@ describe('MessageTraceInterceptor', () => {
 
     await expect(firstValueFrom(interceptor.intercept(context, errorCallHandler(failure)))).rejects.toBe(failure);
 
-    expect(messagesCounter().add).toHaveBeenCalledWith(1, expect.objectContaining({ outcome: 'error' }));
+    expect(messagesCounter()!.add).toHaveBeenCalledWith(1, expect.objectContaining({ outcome: 'error' }));
   });
 
   it('never uses the message offset as a metric attribute', async () => {
@@ -202,7 +218,7 @@ describe('MessageTraceInterceptor', () => {
 
     await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
 
-    const attributes = messagesCounter().add.mock.calls[0][1] as Record<string, unknown>;
+    const attributes = messagesCounter()!.add.mock.calls[0][1] as Record<string, unknown>;
     expect(Object.values(attributes)).not.toContain('918273');
   });
 });
