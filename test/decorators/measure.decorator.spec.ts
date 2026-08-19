@@ -42,9 +42,18 @@ function applyMeasure(methodName: keyof Sample, options?: MeasureOptions | strin
 }
 
 describe('@Measure', () => {
-  it('creates a `<name>.calls` counter and a `<name>.duration` histogram', () => {
+  it('creates a `<name>.calls` counter and a `<name>.duration` histogram, resolved on first call — not at decoration time', () => {
     const meter = mockMeter();
-    applyMeasure('syncOk', 'payment.process');
+    const wrapped = applyMeasure('syncOk', 'payment.process');
+
+    // Not yet: decoration alone must not touch the Metrics API. Decoration
+    // runs at class-load time, which can happen before initializeTelemetry()
+    // does (see claude.md) — resolving eagerly here would silently bind to
+    // whatever (possibly noop) MeterProvider is active at that moment.
+    expect(meter.createCounter).not.toHaveBeenCalled();
+    expect(meter.createHistogram).not.toHaveBeenCalled();
+
+    wrapped(1);
 
     expect(meter.createCounter).toHaveBeenCalledWith('payment.process.calls', expect.objectContaining({ description: expect.any(String) }));
     expect(meter.createHistogram).toHaveBeenCalledWith(
@@ -101,6 +110,23 @@ describe('@Measure', () => {
 
     const counter = meter.created['counter:m.with-attrs.calls'] as { add: ReturnType<typeof vi.fn> };
     expect(counter.add).toHaveBeenCalledWith(1, { tenant: 'acme', outcome: 'success' });
+  });
+
+  it('uses whichever MeterProvider is active at call time, not at decoration time', () => {
+    // Regression test: decoration can happen before initializeTelemetry()
+    // runs (any class transitively imported ahead of AppModule's own
+    // @Module() decorator, since TelemetryModule.forRoot() is the SDK's
+    // sole entry point — see claude.md). A noop meter active AT DECORATION
+    // TIME must not get baked in; only the meter active at CALL time matters.
+    const noopMeter = mockMeter();
+    const wrapped = applyMeasure('syncOk', 'm.late-init');
+    expect(noopMeter.createCounter).not.toHaveBeenCalled();
+
+    const realMeter = mockMeter();
+    wrapped(1);
+
+    expect(noopMeter.createCounter).not.toHaveBeenCalled();
+    expect(realMeter.createCounter).toHaveBeenCalledWith('m.late-init.calls', expect.any(Object));
   });
 
   it('rejects a symbol-keyed property', () => {

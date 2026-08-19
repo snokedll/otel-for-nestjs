@@ -41,14 +41,22 @@ export function Measure(options?: MeasureOptions | string): MethodDecorator {
     const measureName = measureOptions.name ?? resolveDefaultName(target, propertyKey);
     const baseAttributes = measureOptions.attributes ?? {};
 
-    const callsCounter = MetricsService.counter(`${measureName}.calls`, { description: `Total calls to ${measureName}` });
-    const durationHistogram = MetricsService.histogram(`${measureName}.duration`, {
-      description: `Duration of ${measureName}`,
-      unit: 'ms',
-    });
-
+    // Resolved on every call, NOT once here at decoration time: decoration
+    // runs the moment this class is `require()`d, which — since
+    // `TelemetryModule.forRoot()` is the SDK's sole entry point and only
+    // runs once `AppModule` itself starts loading — can happen before
+    // `initializeTelemetry()` ever does, for any class transitively
+    // imported ahead of `AppModule`'s own `@Module()` decorator (see
+    // claude.md). `MetricsService`'s own name-keyed cache makes resolving
+    // on every call cheap after the first real one, the same tradeoff
+    // `@Span()` already makes with `trace.getTracer()`.
     const record = (startTime: number, outcome: 'success' | 'error'): void => {
       const attributes = { ...baseAttributes, outcome };
+      const callsCounter = MetricsService.counter(`${measureName}.calls`, { description: `Total calls to ${measureName}` });
+      const durationHistogram = MetricsService.histogram(`${measureName}.duration`, {
+        description: `Duration of ${measureName}`,
+        unit: 'ms',
+      });
       durationHistogram.record(performance.now() - startTime, attributes);
       callsCounter.add(1, attributes);
     };

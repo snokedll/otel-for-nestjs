@@ -973,6 +973,123 @@ entrada nova se descobrir algo que não estava documentado.
     problema — agora usam interfaces tipadas de verdade, mesmo padrão dos
     exemplos públicos.
 
+41. **`@Measure()` criava o Counter/Histogram no momento da DECORAÇÃO
+    (carregamento da classe), não da chamada — regressão real introduzida
+    pela decisão 31, achada pelo usuário em produção: `@Measure` sozinho,
+    sem `@Span`, não gerava métrica nenhuma.** Causa raiz: decisão 31 moveu
+    `initializeTelemetry()` pra dentro de `TelemetryModule.forRoot()`, que só
+    roda quando o decorator `@Module()` do `AppModule` é avaliado — e isso
+    acontece DEPOIS que `AppModule` já importou (logo, carregou) qualquer
+    módulo listado antes dele no próprio arquivo (`import { InvoicesModule }
+    from ...` sempre roda antes do corpo do `@Module({...})`, já que
+    imports de um arquivo executam antes do resto do código do arquivo).
+    `@Measure()`'s `MetricsService.counter(...)`/`.histogram(...)` rodavam
+    DIRETO no corpo da função do decorator (fora do wrapper retornado) —
+    ou seja, na hora em que a CLASSE é carregada, não em cada chamada do
+    método. Pra qualquer classe carregada antes do `AppModule` terminar de
+    montar seus `imports` (praticamente qualquer service da aplicação),
+    isso significa: instrumento criado contra o `MeterProvider` NOOP (SDK
+    ainda não inicializado), cacheado sob aquele nome pra sempre — mesmo
+    depois do `initializeTelemetry()` rodar segundos depois.
+
+    Por que só `@Measure` e não `@Span`/`@ContinueTrace`: `@Span()` resolve
+    `trace.getTracer(...)` DENTRO da função wrapper, a cada chamada — nunca
+    cacheia nada na decoração. `@ContinueTrace()` não toca em métrica nem
+    tracer na decoração. Só `@Measure()` tinha esse padrão de "resolver uma
+    vez fora do wrapper". Assimetria confirmada na prática: métricas criadas
+    em CAMPO DE CLASSE/CONSTRUTOR (`private readonly xCounter =
+    MetricsService.counter(...)`) funcionam normalmente, porque só rodam
+    quando o Nest INSTANCIA o serviço via DI — o que acontece dentro de
+    `NestFactory.create()`, ou seja, depois que `TelemetryModule.forRoot()`
+    já rodou. É especificamente código que roda no CARREGAMENTO DO MÓDULO
+    (decoradores de método, `import`s no topo do arquivo) que corre esse
+    risco.
+
+    Fix: `MetricsService.counter(...)`/`.histogram(...)` movidos pra dentro
+    da função que grava o resultado (`record()`), chamada a cada invocação
+    do método — mesmo padrão do `@Span()`. Custo extra por chamada é
+    desprezível: o cache por nome do próprio `MetricsService`
+    (`InstrumentCache`) faz qualquer chamada depois da primeira ser só um
+    lookup em Map. Validado empiricamente na sandbox (não só teste
+    unitário): adicionei `@Measure` sozinho (sem `@Span`) num método
+    chamado automaticamente pelo scheduler a cada 10s, e confirmei via
+    Prometheus real que a métrica não aparecia ANTES do fix e aparecia
+    normalmente DEPOIS — revertido depois do teste.
+
+42. **O mesmo risco de timing da decisão 41 não era exclusivo do
+    `@Measure()` — `MetricsService.counter()`/`.histogram()`/`.upDownCounter()`
+    usados diretamente em ESCOPO DE MÓDULO (`const x =
+    MetricsService.counter(...)` no topo do arquivo, fora de classe)
+    sofrem exatamente o mesmo problema, e a decisão 41 generalizava demais
+    ao dizer que só "código que roda no carregamento do módulo" era
+    afetado — campo de classe/construtor está seguro (roda na instanciação
+    via DI, depois do `forRoot()`), mas módulo top-level roda no `import`,
+    antes.** Achado pela pergunta direta do usuário ("mas mesmo usando só
+    o MetricsService, já não deveria funcionar?") e confirmado
+    empiricamente: contador criado no topo de `invoices.service.ts` (fora
+    da classe) e incrementado dentro de `findAllPending()` nunca apareceu
+    no Prometheus mesmo depois de ~100s de espera — a resolução do
+    instrumento tinha acontecido contra o `MeterProvider` NOOP no momento
+    do `import`, cacheada pra sempre sob aquele nome.
+
+    Fix — mais radical que o da decisão 41, resolve o problema NA RAIZ em
+    vez de caso a caso: `MetricsService.counter()`/`.histogram()`/
+    `.upDownCounter()` agora retornam um objeto-proxy cujo `.add()`/
+    `.record()` só resolve o instrumento OTel de verdade (via o mesmo
+    `InstrumentCache` por nome) na hora em que É CHAMADO — nunca na hora
+    em que a própria factory (`MetricsService.counter(...)`) é chamada.
+    Isso torna QUALQUER padrão de uso seguro por construção, independente
+    de quando a factory roda — escopo de módulo, campo de classe, dentro
+    de decorator, antes ou depois de `initializeTelemetry()` — porque
+    tráfego real (a chamada de `.add()`/`.record()`) só acontece depois do
+    bootstrap completo, na prática sempre. Isso torna a correção manual
+    feita na decisão 41 dentro de `measure.decorator.ts` redundante (ela
+    já resolvia dentro do wrapper, então já estava certa por acidente),
+    mas foi deixada como está — resolver duas vezes (uma no decorator, uma
+    dentro do proxy) é inofensivo e documenta a intenção em ambos os
+    lugares.
+
+    Cuidado ao implementar o proxy: a primeira versão sempre repassava um
+    3º argumento `context` pro `.add()`/`.record()` do instrumento real,
+    mesmo quando `undefined` e mesmo quando quem chamou não passou
+    `context` nenhum — quebrando testes que faziam
+    `expect(counter.add).toHaveBeenCalledWith(1, {...})` sem esperar um 3º
+    argumento. Corrigido com uma função auxiliar (`recordValue`) que usa
+    rest-params (`(...args) => instrument.add(...args)`) pra repassar
+    exatamente a quantidade de argumentos que quem chamou passou — mesmo
+    padrão problemático se repetiu uma segunda vez dentro da própria
+    correção (a função `invoke` intermediária também precisava ser
+    rest-param, não aridade fixa) antes de sair certo.
+
+    `observableGauge()` FICA DE FORA dessa mudança — não tem "primeira
+    chamada" pra adiar até, já que é um instrumento pull-based (o
+    `Meter.createObservableGauge()` só registra o callback, quem decide
+    quando ler é o Collector). Continua sendo resolvido imediatamente,
+    então continua exigindo ser chamado de construtor/código de instância
+    (nunca de escopo de módulo) — documentado explicitamente no JSDoc do
+    método.
+
+    Cogitado e descartado: um `resetMetricsInstrumentCache()` chamado de
+    dentro de `initializeTelemetry()` depois do `activeSdk.start()`, como
+    reforço extra. Removido depois de perceber que é código morto — o
+    design de resolução adiada já resolve o problema sozinho pra
+    `counter`/`histogram`/`upDownCounter` (a resolução só acontece quando
+    `.add()`/`.record()` roda de verdade, o que na prática só acontece
+    depois do bootstrap completo), e nem se aplicaria a `observableGauge`
+    (que não é cacheado por nome do jeito que os outros são).
+
+    Validado empiricamente na sandbox reproduzindo o cenário exato que
+    provou o bug: contador de módulo (`module-scope-test`) criado fora da
+    classe, incrementado a cada 10s pelo scheduler de `findAllPending()` —
+    apareceu no Prometheus depois de ~55s (dentro do intervalo de export
+    de ~60s do `PeriodicExportingMetricReader`), confirmando que o mesmo
+    cenário que antes NUNCA aparecia agora funciona. Revertido depois do
+    teste. Suite de testes (`metrics.service.spec.ts`,
+    `http-trace.interceptor.spec.ts`, `message-trace.interceptor.spec.ts`)
+    reescrita pra refletir resolução adiada — instrumento subjacente
+    (`meter.created['counter:...']`) só existe depois da primeira
+    `.add()`/`.record()` real, não mais imediatamente depois da factory.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver
