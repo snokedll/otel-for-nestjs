@@ -1090,6 +1090,75 @@ entrada nova se descobrir algo que não estava documentado.
     (`meter.created['counter:...']`) só existe depois da primeira
     `.add()`/`.record()` real, não mais imediatamente depois da factory.
 
+43. **`endpoint` com path customizado (não `/v1/<signal>`) tinha o path do
+    sinal anexado por cima em vez de ser respeitado como está — só o
+    endpoint já terminando EXATAMENTE com o path esperado escapava disso.**
+    Achado pelo usuário testando contra um Collector real com base path
+    próprio. Comportamento antigo: `appendOtlpPathIfMissing` só comparava
+    sufixo (`trimmed.endsWith(otlpPath)`) — então `http://collector:4318`
+    (DNS puro) e `http://collector:4318/rota-customizada` (com path
+    próprio) recebiam o mesmo tratamento, ambos ganhavam `/v1/metrics`
+    (etc.) anexado, resultando em `http://collector:4318/rota-customizada/v1/metrics`
+    — uma URL que provavelmente não existe no Collector real do usuário,
+    export falhando (em silêncio — ver decisão sobre o `diag` logger no
+    histórico da conversa, não registrado como decisão numerada porque não
+    envolveu mudança de código, só diagnóstico).
+
+    Fix: `appendOtlpPathForBareOrigin` agora usa `new URL(url).pathname`
+    pra decidir — só anexa o path do sinal quando o pathname é vazio ou
+    `/` (ou seja, endpoint é só DNS/origin, com ou sem barra final); QUALQUER
+    path próprio (`/otlp`, `/rota-customizada`, ou já o path OTLP exato) é
+    respeitado byte a byte, sem nenhuma modificação — nem a barra final é
+    removida. `URL` (não regex/string matching) escolhido de propósito:
+    decide corretamente independente do formato do path customizado. Uma
+    string que não é uma URL absoluta parseável (raro, mas configuração
+    vem do usuário) é devolvida sem tocar, em vez de arriscar um parse
+    heurístico errado.
+
+    Teste de DoS (`security.spec.ts`, path com 200.000 barras não-finais)
+    ajustado: antes verificava que o path do sinal era anexado mesmo nesse
+    caso adversarial; agora esse endpoint tem path (não é bare origin),
+    então é respeitado como está — o teste continua garantindo que o
+    parsing continua O(n), só a asserção do resultado esperado mudou.
+
+44. **Métrica exportada sem erro nenhum (`diag` limpo, Collector responde
+    200) mas nunca chega ao backend final — causa raiz identificada:
+    temporalidade de agregação. O SDK nunca expôs uma forma de configurar
+    isso, sempre usando o default `cumulative` do `@opentelemetry/api`.**
+    Backends como o da Dynatrace só aceitam `delta` pra métricas do tipo
+    Sum (counters, histogramas) — uma métrica reportada como `cumulative`
+    é aceita pelo Collector (que só encaminha, por isso nenhum erro
+    aparece do lado de quem envia) e descartada mais adiante, sem
+    nenhum sinal visível pra esta SDK. Aplicações .NET do mesmo usuário
+    funcionavam contra o mesmo Collector — consistente com a stack .NET
+    já vindo configurada com `delta` (prática comum e documentada pra
+    quem integra com Dynatrace), enquanto essa SDK não dava nenhuma forma
+    de fazer o mesmo além da variável de ambiente crua
+    `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` (funcional, mas
+    não documentada nem parte do `TelemetryConfig` — descoberta só lendo
+    o código-fonte do `@opentelemetry/exporter-metrics-otlp-http`).
+
+    Fix: novo campo `metrics.temporalityPreference?: 'cumulative' |
+    'delta' | 'lowmemory'` em `TelemetryConfig`, resolvido em
+    `MetricsSignalConfig` (`telemetry-config.ts`) e repassado como
+    `AggregationTemporalityPreference` (enum real do OTel) pro exporter de
+    métricas em `initialize-telemetry.ts`, via uma tabela de mapeamento
+    (`TEMPORALITY_PREFERENCE_BY_NAME`) — mantendo a API pública como
+    string union simples, no mesmo estilo de `OtlpProtocol`, em vez de
+    expor o enum numérico do OTel diretamente. Deixado **`undefined`**
+    (não defaultado pra `'cumulative'`) quando o usuário não configura,
+    de propósito — repassar `undefined` pro exporter faz ele cair no
+    próprio fallback (a env var, senão `cumulative`), em vez desta SDK
+    fixar um default que brigaria com quem já configura a env var
+    diretamente.
+
+    Validado empiricamente (não só teste unitário): com o mesmo receptor
+    OTLP genérico da decisão 43, `temporalityPreference: 'delta'` mudou o
+    campo `sum.aggregationTemporality` do payload de `2` (CUMULATIVE) pra
+    `1` (DELTA) no counter de teste — confirmando que o valor realmente
+    chega até o exporter e afeta o payload de verdade, não só a
+    configuração interna.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver

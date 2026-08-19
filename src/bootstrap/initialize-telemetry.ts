@@ -6,7 +6,7 @@ import { OTLPTraceExporter as OTLPTraceExporterJson } from '@opentelemetry/expor
 import { OTLPTraceExporter as OTLPTraceExporterProto } from '@opentelemetry/exporter-trace-otlp-proto';
 import { OTLPLogExporter as OTLPLogExporterJson } from '@opentelemetry/exporter-logs-otlp-http';
 import { OTLPLogExporter as OTLPLogExporterProto } from '@opentelemetry/exporter-logs-otlp-proto';
-import { OTLPMetricExporter as OTLPMetricExporterJson } from '@opentelemetry/exporter-metrics-otlp-http';
+import { OTLPMetricExporter as OTLPMetricExporterJson, AggregationTemporalityPreference } from '@opentelemetry/exporter-metrics-otlp-http';
 import { OTLPMetricExporter as OTLPMetricExporterProto } from '@opentelemetry/exporter-metrics-otlp-proto';
 import { BatchLogRecordProcessor, type LogRecordProcessor, type LogRecordExporter } from '@opentelemetry/sdk-logs';
 import {
@@ -15,16 +15,26 @@ import {
   type PushMetricExporter,
 } from '@opentelemetry/sdk-metrics';
 import { BatchSpanProcessor, type SpanProcessor, type SpanExporter } from '@opentelemetry/sdk-trace-base';
-import { resolveTelemetryConfig, type TelemetryConfig, type OtlpProtocol, type ResolvedTelemetryConfig } from '../config/telemetry-config';
+import {
+  resolveTelemetryConfig,
+  type TelemetryConfig,
+  type OtlpProtocol,
+  type ResolvedTelemetryConfig,
+  type TemporalityPreference,
+} from '../config/telemetry-config';
 
 interface OtlpExporterOptions {
   url?: string;
 }
 
+interface MetricsExporterOptions extends OtlpExporterOptions {
+  temporalityPreference?: AggregationTemporalityPreference;
+}
+
 interface SignalExporterFactories {
   traces: (options: OtlpExporterOptions) => SpanExporter;
   logs: (options: OtlpExporterOptions) => LogRecordExporter;
-  metrics: (options: OtlpExporterOptions) => PushMetricExporter;
+  metrics: (options: MetricsExporterOptions) => PushMetricExporter;
 }
 
 /** Strategy table: one exporter factory set per OTLP wire format. */
@@ -43,6 +53,27 @@ const EXPORTER_FACTORIES: Record<OtlpProtocol, SignalExporterFactories> = {
 
 function toExporterOptions(endpoint: string | undefined): OtlpExporterOptions {
   return endpoint ? { url: endpoint } : {};
+}
+
+const TEMPORALITY_PREFERENCE_BY_NAME: Record<TemporalityPreference, AggregationTemporalityPreference> = {
+  cumulative: AggregationTemporalityPreference.CUMULATIVE,
+  delta: AggregationTemporalityPreference.DELTA,
+  lowmemory: AggregationTemporalityPreference.LOWMEMORY,
+};
+
+/**
+ * Same as {@link toExporterOptions}, plus `temporalityPreference` when
+ * configured. Left out entirely (rather than passed as `undefined`) when
+ * not configured, so the exporter falls through to its own env-var-based
+ * resolution (`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`) instead
+ * of a hardcoded default fighting it.
+ */
+function toMetricsExporterOptions(resolved: ResolvedTelemetryConfig['metrics']): MetricsExporterOptions {
+  const options: MetricsExporterOptions = toExporterOptions(resolved.endpoint);
+  if (resolved.temporalityPreference) {
+    options.temporalityPreference = TEMPORALITY_PREFERENCE_BY_NAME[resolved.temporalityPreference];
+  }
+  return options;
 }
 
 /**
@@ -77,7 +108,7 @@ function buildProcessors(resolved: ResolvedTelemetryConfig) {
     : [];
 
   const metricReaders: IMetricReader[] = resolved.metrics.enabled
-    ? [new PeriodicExportingMetricReader({ exporter: factories.metrics(toExporterOptions(resolved.metrics.endpoint)) })]
+    ? [new PeriodicExportingMetricReader({ exporter: factories.metrics(toMetricsExporterOptions(resolved.metrics)) })]
     : [];
 
   return { spanProcessors, logRecordProcessors, metricReaders };

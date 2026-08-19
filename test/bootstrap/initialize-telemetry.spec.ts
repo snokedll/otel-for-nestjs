@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ATTR_DEPLOYMENT_ENVIRONMENT_NAME } from '@opentelemetry/semantic-conventions';
 
 const nodeSdkInstances: Array<{ config: unknown; start: ReturnType<typeof vi.fn>; shutdown: ReturnType<typeof vi.fn> }> = [];
+const metricExporterConfigs: unknown[] = [];
 
 vi.mock('@opentelemetry/sdk-node', () => ({
   NodeSDK: vi.fn().mockImplementation(function (this: unknown, config: unknown) {
@@ -15,7 +16,19 @@ vi.mock('@opentelemetry/auto-instrumentations-node', () => ({
   getNodeAutoInstrumentations: vi.fn().mockReturnValue([]),
 }));
 
+// Only the proto metrics exporter is mocked (the default protocol, matching
+// every test below that doesn't set `protocol` explicitly) — just to
+// capture the config it's constructed with; `AggregationTemporalityPreference`
+// itself still comes from the real, unmocked `exporter-metrics-otlp-http`.
+vi.mock('@opentelemetry/exporter-metrics-otlp-proto', () => ({
+  OTLPMetricExporter: vi.fn().mockImplementation(function (config: unknown) {
+    metricExporterConfigs.push(config);
+    return { shutdown: vi.fn(), forceFlush: vi.fn() };
+  }),
+}));
+
 const { initializeTelemetry, shutdownTelemetry } = await import('../../src/bootstrap/initialize-telemetry');
+const { AggregationTemporalityPreference } = await import('@opentelemetry/exporter-metrics-otlp-http');
 
 function lastSdkConfig() {
   return nodeSdkInstances[nodeSdkInstances.length - 1].config as {
@@ -29,6 +42,7 @@ function lastSdkConfig() {
 
 beforeEach(() => {
   nodeSdkInstances.length = 0;
+  metricExporterConfigs.length = 0;
 });
 
 afterEach(async () => {
@@ -77,6 +91,25 @@ describe('initializeTelemetry', () => {
     expect(config.spanProcessors).toHaveLength(1);
     expect(config.logRecordProcessors).toHaveLength(1);
     expect(config.metricReaders).toEqual([]);
+  });
+
+  it('does not set a temporality preference on the metrics exporter by default, leaving the OTLP env var in control', () => {
+    initializeTelemetry({ serviceName: 'svc' });
+    expect(metricExporterConfigs[0]).not.toHaveProperty('temporalityPreference');
+  });
+
+  it('passes an explicit delta temporality preference through to the metrics exporter', () => {
+    initializeTelemetry({ serviceName: 'svc', metrics: { temporalityPreference: 'delta' } });
+    expect((metricExporterConfigs[0] as { temporalityPreference: unknown }).temporalityPreference).toBe(
+      AggregationTemporalityPreference.DELTA,
+    );
+  });
+
+  it('passes an explicit lowmemory temporality preference through to the metrics exporter', () => {
+    initializeTelemetry({ serviceName: 'svc', metrics: { temporalityPreference: 'lowmemory' } });
+    expect((metricExporterConfigs[0] as { temporalityPreference: unknown }).temporalityPreference).toBe(
+      AggregationTemporalityPreference.LOWMEMORY,
+    );
   });
 
   it('leaves resource undefined when no environment is configured', () => {

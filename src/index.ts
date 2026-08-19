@@ -23,7 +23,9 @@ export {
   type TelemetryConfig,
   type ResolvedTelemetryConfig,
   type SignalConfig,
+  type MetricsSignalConfig,
   type OtlpProtocol,
+  type TemporalityPreference,
 } from './config/telemetry-config';
 
 export { initializeTelemetry, shutdownTelemetry } from './bootstrap/initialize-telemetry';

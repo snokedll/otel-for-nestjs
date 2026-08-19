@@ -5,12 +5,49 @@ import type { EventIgnoreRule, RoutePattern } from '../interceptors/ignore-match
 export interface SignalConfig {
   /** Whether this signal is collected and exported. */
   enabled: boolean;
-  /** OTel Collector URL for this signal specifically. Falls back to the top-level `endpoint` when omitted. */
+  /**
+   * OTel Collector URL for this signal specifically. Falls back to the
+   * top-level `endpoint` when omitted. A bare origin (`http://collector:4318`,
+   * with or without a trailing slash) gets the signal's OTLP path appended
+   * automatically (`/v1/logs`, `/v1/traces`, `/v1/metrics`); a URL with any
+   * path of its own (a Collector mounted under a custom base path, a
+   * gateway prefix, ...) is trusted completely and used exactly as given.
+   */
   endpoint?: string;
 }
 
 /** OTLP wire format used when exporting to the Collector over HTTP. */
 export type OtlpProtocol = 'http/json' | 'http/protobuf';
+
+/**
+ * Aggregation temporality reported for Sum-type metrics (counters,
+ * histograms) — see {@link MetricsSignalConfig.temporalityPreference}.
+ */
+export type TemporalityPreference = 'cumulative' | 'delta' | 'lowmemory';
+
+/** {@link SignalConfig} plus the metrics-only temporality knob. */
+export interface MetricsSignalConfig extends SignalConfig {
+  /**
+   * Aggregation temporality sent to the OTLP metrics exporter.
+   * `'cumulative'` (default, matches the OpenTelemetry spec default)
+   * reports each data point as a running total since the process
+   * started; `'delta'` reports only the change since the last export;
+   * `'lowmemory'` uses delta for counters/histograms and cumulative for
+   * everything else, trading a bit of accuracy for not having to keep
+   * every data point's running total in memory.
+   *
+   * Some backends only accept `'delta'` for Sum-type metrics (counters,
+   * histograms) and silently drop anything reported as `'cumulative'` —
+   * with no export error on the sending side, since the Collector still
+   * accepts and forwards the payload; the rejection happens further
+   * downstream, invisible to this SDK. If metrics never show up despite
+   * no export error being logged, this is worth trying. Equivalent to
+   * the standard `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` env
+   * var, which is used automatically when this is left unset — set here,
+   * this option takes priority over that env var.
+   */
+  temporalityPreference?: TemporalityPreference;
+}
 
 type SignalName = 'logs' | 'traces' | 'metrics';
 
@@ -37,6 +74,7 @@ export interface TelemetryConfig {
   /**
    * Default OTel Collector URL, used by any enabled signal that doesn't
    * define its own `endpoint`. Example: `'http://otel-collector:4318'`.
+   * Same bare-origin-vs-custom-path handling as {@link SignalConfig.endpoint}.
    */
   endpoint?: string;
 
@@ -52,7 +90,7 @@ export interface TelemetryConfig {
   /** Traces signal configuration. Enabled by default. */
   traces?: Partial<SignalConfig>;
   /** Metrics signal configuration. Enabled by default. */
-  metrics?: Partial<SignalConfig>;
+  metrics?: Partial<MetricsSignalConfig>;
 
   /**
    * Where to look for the correlation identifier of HTTP requests and
@@ -95,7 +133,7 @@ export interface ResolvedTelemetryConfig {
   protocol: OtlpProtocol;
   logs: SignalConfig;
   traces: SignalConfig;
-  metrics: SignalConfig;
+  metrics: MetricsSignalConfig;
   correlationIdSources: CorrelationIdSource[];
   ignoreRoutes: RoutePattern[];
   ignoreEvents: EventIgnoreRule[];
@@ -122,21 +160,40 @@ function stripTrailingSlashes(url: string): string {
   return url.slice(0, end);
 }
 
-function appendOtlpPathIfMissing(url: string, otlpPath: string): string {
-  const trimmed = stripTrailingSlashes(url);
-  return trimmed.endsWith(otlpPath) ? trimmed : `${trimmed}${otlpPath}`;
+/**
+ * Appends `otlpPath` only when `url` is a bare origin — nothing after the
+ * host[:port] but an empty or root (`/`) path, e.g. `http://collector:4318`
+ * or `http://collector:4318/`. Any URL that already has a path of its own
+ * — a Collector mounted under a custom base path, a gateway prefix, or
+ * already the exact expected OTLP path — is trusted completely and
+ * returned untouched, so it's never doubled up or reshaped.
+ *
+ * `URL` is used instead of string matching specifically so a custom path
+ * is respected regardless of what it looks like; a value that isn't a
+ * parseable absolute URL is left as-is rather than guessed at.
+ */
+function appendOtlpPathForBareOrigin(url: string, otlpPath: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+
+  if (parsed.pathname !== '' && parsed.pathname !== '/') return url;
+  return `${stripTrailingSlashes(url)}${otlpPath}`;
 }
 
 /**
  * Resolves the final endpoint for one signal: the signal-specific URL wins
  * when present, then the general `endpoint`, otherwise `undefined` (letting
  * the OTLP exporter fall back to its own `http://localhost:4318/v1/<signal>`
- * default). Either URL is left untouched if it already ends with the
- * expected OTLP path, so pre-qualified endpoints are never doubled up.
+ * default). See {@link appendOtlpPathForBareOrigin} for exactly when the
+ * signal's OTLP path does and doesn't get appended.
  */
 function resolveEndpoint(specific: string | undefined, general: string | undefined, otlpPath: string): string | undefined {
-  if (specific) return appendOtlpPathIfMissing(specific, otlpPath);
-  if (general) return appendOtlpPathIfMissing(general, otlpPath);
+  if (specific) return appendOtlpPathForBareOrigin(specific, otlpPath);
+  if (general) return appendOtlpPathForBareOrigin(general, otlpPath);
   return undefined;
 }
 
@@ -146,6 +203,17 @@ function resolveSignalConfig(name: SignalName, config: TelemetryConfig): SignalC
   return {
     enabled,
     endpoint: enabled ? resolveEndpoint(partial?.endpoint, config.endpoint, OTLP_PATH_BY_SIGNAL[name]) : undefined,
+  };
+}
+
+function resolveMetricsConfig(config: TelemetryConfig): MetricsSignalConfig {
+  return {
+    ...resolveSignalConfig('metrics', config),
+    // Left unset (rather than defaulted) when the caller doesn't configure
+    // it, so the exporter falls through to
+    // OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE / its own
+    // 'cumulative' default — same precedence the env var itself documents.
+    temporalityPreference: config.metrics?.temporalityPreference,
   };
 }
 
@@ -176,7 +244,7 @@ export function resolveTelemetryConfig(config: TelemetryConfig): ResolvedTelemet
     protocol: config.protocol ?? 'http/protobuf',
     logs: resolveSignalConfig('logs', config),
     traces: resolveSignalConfig('traces', config),
-    metrics: resolveSignalConfig('metrics', config),
+    metrics: resolveMetricsConfig(config),
     correlationIdSources: config.correlationIdSources ?? DEFAULT_CORRELATION_ID_SOURCES,
     ignoreRoutes: config.ignoreRoutes ?? [],
     ignoreEvents: config.ignoreEvents ?? [],
