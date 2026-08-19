@@ -132,12 +132,15 @@ describe('security: algorithmic complexity / DoS resistance', () => {
     // A regex-based trailing-slash trim (`/\/+$/`) is polynomial-time here:
     // a long run of `/` not at the true end forces backtracking at every
     // position within the run. `endpoint` is caller-supplied configuration.
+    // This endpoint has a (huge) non-root path, so it's trusted as given —
+    // not appended to — this test is about parsing it in bounded time, not
+    // about the resulting value.
     const adversarialEndpoint = `http://collector${'/'.repeat(200_000)}notaslash`;
 
     const start = performance.now();
     const resolved = resolveTelemetryConfig({ serviceName: 'svc', endpoint: adversarialEndpoint });
     expect(performance.now() - start).toBeLessThan(100);
-    expect(resolved.traces.endpoint).toBe(`${adversarialEndpoint}/v1/traces`);
+    expect(resolved.traces.endpoint).toBe(adversarialEndpoint);
   });
 });
 

@@ -107,11 +107,11 @@ required.
 |---|---|---|---|
 | `serviceName` | `string` | — (required) | Reported as the `service.name` attribute on every trace, log, and metric. |
 | `environment` | `string` | not set | Reported as the `deployment.environment.name` attribute. Free-form value (`staging`, `production`, `sandbox`, etc.), not a fixed enum. If omitted, no environment attribute is reported. |
-| `endpoint` | `string` | not set | OTel Collector URL, OTLP/HTTP format (e.g. `http://otel-collector:4318`). Used by any enabled signal that does not define its own `endpoint`. |
+| `endpoint` | `string` | not set | OTel Collector URL, OTLP/HTTP format (e.g. `http://otel-collector:4318`). Used by any enabled signal that does not define its own `endpoint`. A bare origin gets the signal's OTLP path appended automatically (`/v1/logs`, `/v1/traces`, `/v1/metrics`); a URL that already has a path of its own (a custom base path, a gateway prefix, ...) is used exactly as given. |
 | `protocol` | `'http/json' \| 'http/protobuf'` | `'http/protobuf'` | OTLP serialization format used when exporting every signal. |
 | `logs` | `{ enabled?: boolean; endpoint?: string }` | `{ enabled: true }` | Logs signal configuration. `endpoint`, if set, overrides `endpoint` for this signal only. |
 | `traces` | `{ enabled?: boolean; endpoint?: string }` | `{ enabled: true }` | Traces signal configuration. |
-| `metrics` | `{ enabled?: boolean; endpoint?: string }` | `{ enabled: true }` | Metrics signal configuration. |
+| `metrics` | `{ enabled?: boolean; endpoint?: string; temporalityPreference?: 'cumulative' \| 'delta' \| 'lowmemory' }` | `{ enabled: true }` | Metrics signal configuration. `temporalityPreference`, if unset, defers entirely to the exporter's own default (`cumulative`, or `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` if set). Some backends only accept `delta` for Sum-type metrics (counters, histograms) and silently drop `cumulative` ones downstream of the Collector — with no export error on the sending side, since the Collector already accepted the payload. If metrics never show up despite a clean `diag` log, try `delta`. |
 | `correlationIdSources` | `CorrelationIdSource[]` | `x-correlation-id`, `correlation-id`, `correlationId` headers, in this order | Locations searched for the correlation-id. See [Correlation-id source](#correlation-id-source). |
 | `ignoreRoutes` | `RoutePattern[]` (`string \| RegExp`) | `[]` | HTTP routes for which no trace, correlation-id, or metric is generated. |
 | `ignoreEvents` | `EventIgnoreRule[]` | `[]` | Consumed events, identified by partial match on the message body and/or headers, for which no trace, correlation-id, or metric is generated. |

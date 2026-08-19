@@ -59,6 +59,26 @@ describe('resolveTelemetryConfig', () => {
     expect(resolved.traces.endpoint).toBe('http://collector:4318/v1/traces');
   });
 
+  it('trusts a custom base path completely instead of appending the signal path onto it', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', traces: { endpoint: 'http://collector:4318/otlp' } });
+    expect(resolved.traces.endpoint).toBe('http://collector:4318/otlp');
+  });
+
+  it('trusts any custom path as given, trailing slash included', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', metrics: { endpoint: 'http://collector:4318/custom/route/' } });
+    expect(resolved.metrics.endpoint).toBe('http://collector:4318/custom/route/');
+  });
+
+  it('leaves temporalityPreference undefined by default', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc' });
+    expect(resolved.metrics.temporalityPreference).toBeUndefined();
+  });
+
+  it('preserves an explicit temporalityPreference', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', metrics: { temporalityPreference: 'delta' } });
+    expect(resolved.metrics.temporalityPreference).toBe('delta');
+  });
+
   it('leaves the endpoint undefined when neither a specific nor a shared endpoint is configured', () => {
     const resolved = resolveTelemetryConfig({ serviceName: 'svc' });
     expect(resolved.traces.endpoint).toBeUndefined();
