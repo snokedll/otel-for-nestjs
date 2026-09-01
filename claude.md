@@ -1159,6 +1159,151 @@ entrada nova se descobrir algo que não estava documentado.
     chega até o exporter e afeta o payload de verdade, não só a
     configuração interna.
 
+45. **Investigação de "métrica não chega a lugar nenhum, sem erro nenhum"
+    (que motivou as decisões 43 e 44) teve causa raiz externa a esta SDK e
+    à SDK .NET equivalente: um pipeline de Collector com dois
+    `filterprocessor`s `include` em sequência sobre métricas — não é bug
+    de código, é infraestrutura, mas vale registrar o padrão de diagnóstico
+    pra próxima vez.** Um `filterprocessor` com `include` funciona como
+    allowlist: só telemetria que casa com o critério sobrevive, o resto é
+    descartado ali mesmo, sem log de erro — é o processor fazendo
+    exatamente o que foi configurado pra fazer. Processors de um pipeline
+    do Collector rodam em série, não em paralelo: a saída de um é a
+    entrada do próximo. Dois `include` sequenciais, cada um com um padrão
+    de nome diferente, não se somam (união) — eles se intersectam (E
+    lógico), porque só sobrevive ao segundo o que já sobreviveu ao
+    primeiro E também casa com o segundo padrão. Dois padrões de prefixo
+    mutuamente exclusivos encadeados assim descartam **tudo**, não
+    seletivamente — resultado indistinguível de "nada está sendo
+    enviado" do lado de quem só vê o `diag` do SDK (que só enxerga se o
+    Collector aceitou o POST, não o que ele faz depois).
+
+    Nuance técnica pra próxima vez que isso for revisado: `match_type:
+    regexp` não ancora automaticamente (`^`/`$`) — casa qualquer
+    substring, não exige que o nome inteiro comece com o padrão. Dois
+    padrões de prefixo só geram interseção vazia de fato quando nenhum
+    nome real de métrica contém as duas substrings ao mesmo tempo (o caso
+    prático de qualquer app real com convenção de nome única por
+    domínio), não por garantia matemática do regex em si.
+
+    Lição de diagnóstico pra troubleshooting futuro desta SDK (e não só
+    dela): se `diag` está limpo, o endpoint resolvido está correto e
+    ainda assim a métrica nunca aparece no backend final, enquanto
+    logs/traces funcionam normalmente pelo mesmo Collector — suspeitar de
+    filtro/allowlist no pipeline de métricas do Collector antes de
+    suspeitar do SDK que envia. Um 200 do Collector confirma só que ele
+    recebeu o payload, não que ele sobreviveu aos processors internos até
+    o exporter final. As decisões 43 (path customizado) e 44
+    (`temporalityPreference`) continuam válidas e vale manter — não eram
+    a causa deste caso específico, mas são correções/capacidades legítimas
+    e independentes (a 43 corrige um bug real de resolução de endpoint; a
+    44 é necessária sempre que o backend não tiver seu próprio processor
+    de conversão de temporalidade, o que nem sempre é garantido).
+
+    **Confirmado empiricamente em produção real (não só análise estática de
+    config):** havia duas versões candidatas do YAML do Collector
+    encontradas em repositórios diferentes, uma com o bug de interseção
+    (dois `include` em sequência) e outra sem — sem acesso ao cluster, não
+    dava pra saber qual estava de fato deployada. Teste decisivo: renomear
+    a métrica de teste pra conter simultaneamente as duas substrings
+    exigidas pelos dois filtros (satisfazendo a interseção, não a união) —
+    a métrica chegou ao destino. Isso confirma, sem ambiguidade, que a
+    versão COM o bug (dois filtros em sequência) é a que está rodando. Uma
+    forma de diagnóstico geral e reaproveitável: quando há incerteza sobre
+    qual config está deployada e não há acesso direto pra checar, um nome
+    de teste desenhado pra só sobreviver sob uma hipótese específica (e
+    falhar sob as outras) resolve a ambiguidade por observação direta,
+    sem precisar de acesso a infraestrutura nenhuma — só depende de poder
+    emitir uma métrica de teste e checar se ela chegou.
+
+46. **Redação de dados sensíveis em log — `logs.sensitiveFields`,
+    100% explícito (sem lista aplicada por padrão), resolvido em tempo de
+    chamada, não de construção.** `TraceLogger` redige campos de qualquer
+    objeto de metadata logado (headers, corpo de requisição/evento,
+    qualquer estrutura aninhada), tanto no console (pino) quanto no
+    `LogRecord` exportado via OTel Logs API — sempre as duas saídas, nunca
+    só uma, pra não vazar num destino o que foi escondido no outro.
+    **Nada é redigido a menos que `logs.sensitiveFields` seja configurado
+    explicitamente** — não existe lista embutida ativa por padrão.
+
+    Decisão de design revisada durante a implementação: a primeira versão
+    tinha uma lista sempre ativa (`authorization`, `password`, etc.) mesmo
+    sem configuração nenhuma, com `sensitiveFields` do usuário só somando
+    a ela. Revertido a pedido — comportamento automático (mesmo que bem
+    intencionado) muda o que sai no log sem o usuário ter pedido
+    explicitamente, o que é surpreendente e difícil de auditar ("por que
+    esse campo sumiu do log?"). Configuração explícita é mais previsível:
+    o usuário decide 100% do que é redigido, sem mágica por trás. A
+    antiga lista padrão virou `RECOMMENDED_SENSITIVE_FIELDS` — exportada,
+    documentada no TSDoc e no README como ponto de partida sugerido, mas
+    o usuário precisa espalhá-la (`[...RECOMMENDED_SENSITIVE_FIELDS,
+    'cpf']`) explicitamente pra ela valer.
+
+    Design do matching (inalterado pela revisão acima): um nome de campo
+    "bare" (`'cpf'`) casa em QUALQUER profundidade, em qualquer chave com
+    esse nome, independente do transporte que produziu o valor (HTTP,
+    Kafka, RabbitMQ, ...) — resolvido por nome de chave, não por
+    posição/shape fixo, já que o formato de headers/body varia entre
+    transportes e forçar um shape único (`{ headers, body }`) seria
+    frágil. Um padrão com `.` (`'body.card.number'`) casa só naquele
+    caminho exato, pra quando o nome bare seria amplo demais. Matching
+    case-insensitive nos dois casos. Nunca muta o objeto original —
+    sempre produz uma cópia nova (com uma exceção de performance: lista
+    de padrões vazia retorna o mesmo objeto sem cópia, já que não há nada
+    pra redigir — e vazia é o estado padrão agora, então isso é o caminho
+    mais comum, não a exceção).
+
+    Mesmo cuidado de timing das decisões 41/42 (e o mesmo padrão, dessa
+    vez replicado de propósito): os padrões ativos são lidos por
+    `TraceLogger` em CADA chamada de log (`getActiveSensitiveFieldPatterns()`),
+    nunca cacheados na construção — um `TraceLogger` instanciado antes de
+    `initializeTelemetry()` rodar (campo de classe, escopo de módulo)
+    ainda redige corretamente assim que o log de verdade acontecer.
+    Confirmado que isso NÃO era necessário pro `otelLogger` já existente
+    (`logs.getLogger(...)`) — investigação mostrou que a Logs API já
+    retorna um `ProxyLogger` que resolve o delegate a cada `.emit()`,
+    diferente da Metrics API que motivou a decisão 42; mas o registro de
+    `sensitiveFields` é config PRÓPRIA desta SDK, não tem proxy nenhum do
+    OTel cuidando disso — por isso precisa do mesmo tratamento manual.
+
+    Registro global simples (`setActiveRedactionConfig`/
+    `getActiveRedactionConfig`/`resetActiveRedactionConfig` em
+    `sensitive-fields.ts`, não em `initialize-telemetry.ts`) — mantém o
+    módulo de bootstrap sem precisar saber de estado de logger, e o
+    módulo de logger sem precisar importar do bootstrap; `initializeTelemetry()`
+    seta o registro (exatamente o que foi configurado, sem merge nenhum)
+    depois de resolver a config, `shutdownTelemetry()` reseta de volta
+    pra lista vazia + placeholder padrão, simetria com o resto do arquivo.
+
+    Placeholder também configurável (`logs.redactionPlaceholder`, default
+    `'[REDACTED]'`) — pedido explícito do usuário, que achou o texto fixo
+    pouco interessante. `patterns` e `placeholder` vivem juntos num único
+    registro (`{ patterns, placeholder }`), setados/lidos/resetados como
+    uma unidade só, já que sempre mudam juntos (resolvidos do mesmo
+    `TelemetryConfig.logs`, no mesmo `initializeTelemetry()`) — em vez de
+    duas variáveis de módulo paralelas exigindo dois getters toda chamada
+    de log. Sempre substitui o VALOR do campo, nunca a chave — a chave
+    fica no log (fica registrado que aquele campo existia e foi
+    escondido), só o conteúdo vira o placeholder configurado, seja qual
+    for o tipo original do valor (string, número, objeto inteiro, array).
+
+    Guarda de poluição de protótipo reaproveitada de
+    `correlation-id-extractor.ts` (`__proto__`/`constructor`/`prototype`
+    nunca copiados pro resultado) — dado de entrada é metadata de log,
+    que pode conter corpo de requisição/evento vindo de fora, mesmo
+    raciocínio de "nunca confiar no shape de dado alheio" já estabelecido
+    ali. Validado empiricamente (não só teste unitário): script standalone
+    contra o `dist/` real confirmando que, sem configuração nenhuma, nada
+    é redigido (nem `authorization` nem `password`), e que depois de
+    configurar um campo customizado (`cpf`), ele é redigido corretamente
+    mesmo aninhado num corpo de evento estilo Kafka.
+
+    SemVer: `2.1.0`, não `2.0.4` — é funcionalidade nova (novo campo de
+    config, novos tipos/função exportados publicamente), não correção de
+    bug. Nesta versão final (explícita), não há mudança de comportamento
+    por padrão pra quem não configurar nada — mas ainda assim é MINOR,
+    não PATCH, por ser capacidade nova.
+
 ## O que ainda NÃO foi construído
 
 - `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver

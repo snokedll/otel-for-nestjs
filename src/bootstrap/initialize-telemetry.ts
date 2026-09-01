@@ -22,6 +22,7 @@ import {
   type ResolvedTelemetryConfig,
   type TemporalityPreference,
 } from '../config/telemetry-config';
+import { setActiveRedactionConfig, resetActiveRedactionConfig } from '../logger/sensitive-fields';
 
 interface OtlpExporterOptions {
   url?: string;
@@ -144,6 +145,7 @@ export function initializeTelemetry(config: TelemetryConfig): NodeSDK {
 
   const resolved = resolveTelemetryConfig(config);
   const { spanProcessors, logRecordProcessors, metricReaders } = buildProcessors(resolved);
+  setActiveRedactionConfig({ patterns: resolved.logs.sensitiveFields, placeholder: resolved.logs.redactionPlaceholder });
 
   activeSdk = new NodeSDK({
     serviceName: resolved.serviceName,
@@ -184,4 +186,5 @@ export async function shutdownTelemetry(): Promise<void> {
 
   await activeSdk.shutdown();
   activeSdk = undefined;
+  resetActiveRedactionConfig();
 }

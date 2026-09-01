@@ -1,5 +1,6 @@
 import { DEFAULT_CORRELATION_ID_SOURCES, type CorrelationIdSource } from '../context/correlation-id-extractor';
 import type { EventIgnoreRule, RoutePattern } from '../interceptors/ignore-matchers';
+import { DEFAULT_REDACTION_PLACEHOLDER, type SensitiveFieldPattern } from '../logger/sensitive-fields';
 
 /** Enable/disable and endpoint override for a single telemetry signal (logs, traces, or metrics). */
 export interface SignalConfig {
@@ -49,6 +50,34 @@ export interface MetricsSignalConfig extends SignalConfig {
   temporalityPreference?: TemporalityPreference;
 }
 
+/** {@link SignalConfig} plus the logs-only sensitive-field redaction knob. */
+export interface LogsSignalConfig extends SignalConfig {
+  /**
+   * Field names (or dot-notation paths) `TraceLogger` redacts from every
+   * logged metadata object. Empty by default — nothing is redacted
+   * unless configured explicitly here; see {@link RECOMMENDED_SENSITIVE_FIELDS}
+   * for a starting-point list (`authorization`, `cookie`, `password`,
+   * ...) to spread into this array.
+   *
+   * A bare name (`'cpf'`) matches that key wherever it appears, at any
+   * nesting depth, regardless of which transport produced it — an HTTP
+   * request/response, a Kafka/RabbitMQ event, or any other structured
+   * metadata a call site passes to `TraceLogger`. A dot-notation path
+   * (`'body.card.number'`) matches only that exact location, for when a
+   * bare name would be too broad. Matching is case-insensitive either way.
+   *
+   * @example ['cpf', 'cardNumber', 'body.customer.email']
+   */
+  sensitiveFields: SensitiveFieldPattern[];
+
+  /**
+   * Value substituted for every field matched by `sensitiveFields`.
+   * Defaults to `'[REDACTED]'` ({@link DEFAULT_REDACTION_PLACEHOLDER}) —
+   * any string works, e.g. `'***'` or `'<oculto>'`.
+   */
+  redactionPlaceholder: string;
+}
+
 type SignalName = 'logs' | 'traces' | 'metrics';
 
 /**
@@ -86,7 +115,7 @@ export interface TelemetryConfig {
   protocol?: OtlpProtocol;
 
   /** Logs signal configuration. Enabled by default. */
-  logs?: Partial<SignalConfig>;
+  logs?: Partial<LogsSignalConfig>;
   /** Traces signal configuration. Enabled by default. */
   traces?: Partial<SignalConfig>;
   /** Metrics signal configuration. Enabled by default. */
@@ -131,7 +160,7 @@ export interface ResolvedTelemetryConfig {
   serviceName: string;
   environment?: string;
   protocol: OtlpProtocol;
-  logs: SignalConfig;
+  logs: LogsSignalConfig;
   traces: SignalConfig;
   metrics: MetricsSignalConfig;
   correlationIdSources: CorrelationIdSource[];
@@ -217,6 +246,16 @@ function resolveMetricsConfig(config: TelemetryConfig): MetricsSignalConfig {
   };
 }
 
+function resolveLogsConfig(config: TelemetryConfig): LogsSignalConfig {
+  return {
+    ...resolveSignalConfig('logs', config),
+    // Explicit only — nothing redacted unless the application configures
+    // this itself. See RECOMMENDED_SENSITIVE_FIELDS for a starting point.
+    sensitiveFields: config.logs?.sensitiveFields ?? [],
+    redactionPlaceholder: config.logs?.redactionPlaceholder ?? DEFAULT_REDACTION_PLACEHOLDER,
+  };
+}
+
 function warnIfMissingEndpoint(name: SignalName, signal: SignalConfig): void {
   if (!signal.enabled || signal.endpoint) return;
   // eslint-disable-next-line no-console
@@ -242,7 +281,7 @@ export function resolveTelemetryConfig(config: TelemetryConfig): ResolvedTelemet
     serviceName: config.serviceName,
     environment: config.environment,
     protocol: config.protocol ?? 'http/protobuf',
-    logs: resolveSignalConfig('logs', config),
+    logs: resolveLogsConfig(config),
     traces: resolveSignalConfig('traces', config),
     metrics: resolveMetricsConfig(config),
     correlationIdSources: config.correlationIdSources ?? DEFAULT_CORRELATION_ID_SOURCES,
