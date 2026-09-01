@@ -24,6 +24,7 @@ export {
   type ResolvedTelemetryConfig,
   type SignalConfig,
   type MetricsSignalConfig,
+  type LogsSignalConfig,
   type OtlpProtocol,
   type TemporalityPreference,
 } from './config/telemetry-config';
@@ -31,6 +32,12 @@ export {
 export { initializeTelemetry, shutdownTelemetry } from './bootstrap/initialize-telemetry';
 
 export { TraceLogger, type LogLevel, type LogMetadata } from './logger/trace-logger';
+export {
+  redactSensitiveFields,
+  RECOMMENDED_SENSITIVE_FIELDS,
+  DEFAULT_REDACTION_PLACEHOLDER,
+  type SensitiveFieldPattern,
+} from './logger/sensitive-fields';
 
 export { MetricsService, type MetricAttributes, type MetricOptions } from './metrics/metrics.service';
 

@@ -79,6 +79,26 @@ describe('resolveTelemetryConfig', () => {
     expect(resolved.metrics.temporalityPreference).toBe('delta');
   });
 
+  it('resolves logs.sensitiveFields to an empty array when unconfigured — nothing redacted by default', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc' });
+    expect(resolved.logs.sensitiveFields).toEqual([]);
+  });
+
+  it('resolves logs.sensitiveFields to exactly the configured list, with nothing added implicitly', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', logs: { sensitiveFields: ['cpf', 'cardNumber'] } });
+    expect(resolved.logs.sensitiveFields).toEqual(['cpf', 'cardNumber']);
+  });
+
+  it('defaults logs.redactionPlaceholder to "[REDACTED]" when unconfigured', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc' });
+    expect(resolved.logs.redactionPlaceholder).toBe('[REDACTED]');
+  });
+
+  it('preserves an explicit logs.redactionPlaceholder', () => {
+    const resolved = resolveTelemetryConfig({ serviceName: 'svc', logs: { redactionPlaceholder: '***' } });
+    expect(resolved.logs.redactionPlaceholder).toBe('***');
+  });
+
   it('leaves the endpoint undefined when neither a specific nor a shared endpoint is configured', () => {
     const resolved = resolveTelemetryConfig({ serviceName: 'svc' });
     expect(resolved.traces.endpoint).toBeUndefined();

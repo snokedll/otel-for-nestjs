@@ -29,6 +29,7 @@ vi.mock('@opentelemetry/exporter-metrics-otlp-proto', () => ({
 
 const { initializeTelemetry, shutdownTelemetry } = await import('../../src/bootstrap/initialize-telemetry');
 const { AggregationTemporalityPreference } = await import('@opentelemetry/exporter-metrics-otlp-http');
+const { getActiveRedactionConfig, DEFAULT_REDACTION_PLACEHOLDER } = await import('../../src/logger/sensitive-fields');
 
 function lastSdkConfig() {
   return nodeSdkInstances[nodeSdkInstances.length - 1].config as {
@@ -112,6 +113,16 @@ describe('initializeTelemetry', () => {
     );
   });
 
+  it('sets the resolved sensitive-field patterns for TraceLogger to read, exactly as configured', () => {
+    initializeTelemetry({ serviceName: 'svc', logs: { sensitiveFields: ['cpf'] } });
+    expect(getActiveRedactionConfig()).toEqual({ patterns: ['cpf'], placeholder: DEFAULT_REDACTION_PLACEHOLDER });
+  });
+
+  it('sets a configured redactionPlaceholder for TraceLogger to read', () => {
+    initializeTelemetry({ serviceName: 'svc', logs: { sensitiveFields: ['cpf'], redactionPlaceholder: '***' } });
+    expect(getActiveRedactionConfig()).toEqual({ patterns: ['cpf'], placeholder: '***' });
+  });
+
   it('leaves resource undefined when no environment is configured', () => {
     initializeTelemetry({ serviceName: 'svc' });
     expect(lastSdkConfig().resource).toBeUndefined();
@@ -162,6 +173,12 @@ describe('shutdownTelemetry', () => {
 
   it('is a no-op when no SDK was initialized', async () => {
     await expect(shutdownTelemetry()).resolves.toBeUndefined();
+  });
+
+  it('resets the active redaction config back to the empty list and the default placeholder', async () => {
+    initializeTelemetry({ serviceName: 'svc', logs: { sensitiveFields: ['cpf'], redactionPlaceholder: '***' } });
+    await shutdownTelemetry();
+    expect(getActiveRedactionConfig()).toEqual({ patterns: [], placeholder: DEFAULT_REDACTION_PLACEHOLDER });
   });
 
   it('is a no-op the second time it is called', async () => {

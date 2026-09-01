@@ -2,6 +2,7 @@ import pino, { type Logger as PinoLogger } from 'pino';
 import { logs, SeverityNumber, type Logger as OtelLogger, type LogAttributes } from '@opentelemetry/api-logs';
 import type { LoggerService } from '@nestjs/common';
 import { TraceContextManager, CORRELATION_ID_ATTRIBUTE } from '../context/trace-context';
+import { getActiveRedactionConfig, redactSensitiveFields } from './sensitive-fields';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
 
@@ -100,6 +101,16 @@ function parseErrorCallArgs(message: unknown, optionalParams: unknown[]): Parsed
  * as the application's logger via `app.useLogger(new TraceLogger())` —
  * from then on the framework's own internal logs are correlated and
  * exported too, not just logs the application emits explicitly.
+ *
+ * Every `metadata` object passed to a log call — headers, a request or
+ * event body, any nested structure — is redacted before reaching either
+ * destination: fields matching `TelemetryConfig.logs.sensitiveFields` are
+ * replaced with `logs.redactionPlaceholder` (`'[REDACTED]'` by default),
+ * at any nesting depth, regardless of which transport the metadata came
+ * from. Nothing is redacted unless `sensitiveFields` is configured
+ * explicitly — see {@link RECOMMENDED_SENSITIVE_FIELDS} for a
+ * starting-point list. The original object passed by the caller is never
+ * mutated.
  */
 export class TraceLogger implements LoggerService {
   private readonly pinoLogger: PinoLogger;
@@ -124,8 +135,16 @@ export class TraceLogger implements LoggerService {
     const correlationId = TraceContextManager.getCorrelationId();
     const traceId = TraceContextManager.getTraceId();
 
+    // Resolved fresh on every call, not cached at construction — a
+    // TraceLogger instantiated before initializeTelemetry() runs (a class
+    // field, module scope, ...) still redacts correctly by the time real
+    // logging traffic happens. Same reasoning as MetricsService's
+    // deferred instrument resolution, see claude.md.
+    const { patterns, placeholder } = getActiveRedactionConfig();
+    const redactedMetadata = metadata && redactSensitiveFields(metadata, patterns, placeholder);
+
     const consoleFields: Record<string, unknown> = {
-      ...metadata,
+      ...redactedMetadata,
       traceId,
       ...(correlationId ? { correlationId } : {}),
       ...(context ? { context } : {}),
@@ -134,7 +153,7 @@ export class TraceLogger implements LoggerService {
     this.pinoLogger[level](consoleFields, message);
 
     const attributes: LogAttributes = {
-      ...metadata,
+      ...redactedMetadata,
       'app.trace_id': traceId,
       ...(correlationId ? { [CORRELATION_ID_ATTRIBUTE]: correlationId } : {}),
       ...(context ? { 'app.logger_context': context } : {}),

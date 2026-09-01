@@ -24,10 +24,18 @@ vi.mock('@opentelemetry/api-logs', async (importOriginal) => {
 const pinoModule = await import('pino');
 const { TraceLogger } = await import('../../src/logger/trace-logger');
 const { TraceContextManager } = await import('../../src/context/trace-context');
+const { setActiveRedactionConfig, resetActiveRedactionConfig, DEFAULT_REDACTION_PLACEHOLDER } = await import(
+  '../../src/logger/sensitive-fields'
+);
 
 function lastPinoInstance() {
   const factory = vi.mocked(pinoModule.default);
   return factory.mock.results[factory.mock.results.length - 1].value as Record<string, ReturnType<typeof vi.fn>>;
+}
+
+/** Test-only shorthand — production code always goes through initializeTelemetry(). */
+function setSensitiveFields(patterns: string[], placeholder = DEFAULT_REDACTION_PLACEHOLDER) {
+  setActiveRedactionConfig({ patterns, placeholder });
 }
 
 beforeEach(() => {
@@ -38,6 +46,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  resetActiveRedactionConfig();
 });
 
 describe('TraceLogger', () => {
@@ -186,6 +195,57 @@ describe('TraceLogger', () => {
       const call = lastPinoInstance().error.mock.calls[0][0] as { err?: Error; context?: string };
       expect(call.err).toBeUndefined();
       expect(call.context).toBe('SomeContext');
+    });
+  });
+
+  describe('sensitive-field redaction', () => {
+    it('redacts nothing by default — sensitiveFields must be configured explicitly', () => {
+      new TraceLogger().info('hello', { headers: { authorization: 'Bearer secret' } });
+      expect(lastPinoInstance().info).toHaveBeenCalledWith(expect.objectContaining({ headers: { authorization: 'Bearer secret' } }), 'hello');
+    });
+
+    it('redacts a configured field from both the console output and the OTel LogRecord', () => {
+      setSensitiveFields(['authorization']);
+      new TraceLogger().info('hello', { headers: { authorization: 'Bearer secret' } });
+
+      expect(lastPinoInstance().info).toHaveBeenCalledWith(
+        expect.objectContaining({ headers: { authorization: '[REDACTED]' } }),
+        'hello',
+      );
+      expect(otelLoggerEmit).toHaveBeenCalledWith(
+        expect.objectContaining({ attributes: expect.objectContaining({ headers: { authorization: '[REDACTED]' } }) }),
+      );
+    });
+
+    it('redacts a configured field at any nesting depth, regardless of which transport shape the metadata came from', () => {
+      setSensitiveFields(['cpf']);
+      new TraceLogger().info('kafka event', { event: { body: { customer: { cpf: '123' } } } });
+
+      expect(lastPinoInstance().info).toHaveBeenCalledWith(
+        expect.objectContaining({ event: { body: { customer: { cpf: '[REDACTED]' } } } }),
+        'kafka event',
+      );
+    });
+
+    it('does not redact fields absent from every configured pattern', () => {
+      setSensitiveFields(['cpf']);
+      new TraceLogger().info('hello', { userId: 42 });
+      expect(lastPinoInstance().info).toHaveBeenCalledWith(expect.objectContaining({ userId: 42 }), 'hello');
+    });
+
+    it('uses a configured redactionPlaceholder instead of the default [REDACTED]', () => {
+      setSensitiveFields(['authorization'], '***');
+      new TraceLogger().info('hello', { headers: { authorization: 'Bearer secret' } });
+
+      expect(lastPinoInstance().info).toHaveBeenCalledWith(expect.objectContaining({ headers: { authorization: '***' } }), 'hello');
+      expect(otelLoggerEmit).toHaveBeenCalledWith(expect.objectContaining({ attributes: expect.objectContaining({ headers: { authorization: '***' } }) }));
+    });
+
+    it('never mutates the metadata object the caller passed in', () => {
+      setSensitiveFields(['authorization']);
+      const metadata = { headers: { authorization: 'Bearer secret' } };
+      new TraceLogger().info('hello', metadata);
+      expect(metadata.headers.authorization).toBe('Bearer secret');
     });
   });
 });

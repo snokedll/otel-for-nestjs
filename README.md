@@ -15,7 +15,8 @@ From a single configuration, the SDK provides:
   `x-correlation-id`).
 - `TraceLogger`, a NestJS `LoggerService` that correlates every log
   emitted by the application (and by the framework itself) to the active
-  trace/correlation-id.
+  trace/correlation-id, and redacts configured sensitive fields (headers,
+  request/event bodies, any nested structure).
 - `@Span()` and `@Measure()` decorators for manual method instrumentation.
 - `MetricsService`, a facade over the OpenTelemetry Metrics API
   (counters, histograms, up-down-counters, observable gauges).
@@ -109,7 +110,7 @@ required.
 | `environment` | `string` | not set | Reported as the `deployment.environment.name` attribute. Free-form value (`staging`, `production`, `sandbox`, etc.), not a fixed enum. If omitted, no environment attribute is reported. |
 | `endpoint` | `string` | not set | OTel Collector URL, OTLP/HTTP format (e.g. `http://otel-collector:4318`). Used by any enabled signal that does not define its own `endpoint`. A bare origin gets the signal's OTLP path appended automatically (`/v1/logs`, `/v1/traces`, `/v1/metrics`); a URL that already has a path of its own (a custom base path, a gateway prefix, ...) is used exactly as given. |
 | `protocol` | `'http/json' \| 'http/protobuf'` | `'http/protobuf'` | OTLP serialization format used when exporting every signal. |
-| `logs` | `{ enabled?: boolean; endpoint?: string }` | `{ enabled: true }` | Logs signal configuration. `endpoint`, if set, overrides `endpoint` for this signal only. |
+| `logs` | `{ enabled?: boolean; endpoint?: string; sensitiveFields?: string[]; redactionPlaceholder?: string }` | `{ enabled: true }` | Logs signal configuration. `endpoint`, if set, overrides `endpoint` for this signal only. `sensitiveFields` is empty by default — nothing is redacted unless configured. `redactionPlaceholder` defaults to `'[REDACTED]'`. See [Redacting sensitive data](#redacting-sensitive-data). |
 | `traces` | `{ enabled?: boolean; endpoint?: string }` | `{ enabled: true }` | Traces signal configuration. |
 | `metrics` | `{ enabled?: boolean; endpoint?: string; temporalityPreference?: 'cumulative' \| 'delta' \| 'lowmemory' }` | `{ enabled: true }` | Metrics signal configuration. `temporalityPreference`, if unset, defers entirely to the exporter's own default (`cumulative`, or `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` if set). Some backends only accept `delta` for Sum-type metrics (counters, histograms) and silently drop `cumulative` ones downstream of the Collector — with no export error on the sending side, since the Collector already accepted the payload. If metrics never show up despite a clean `diag` log, try `delta`. |
 | `correlationIdSources` | `CorrelationIdSource[]` | `x-correlation-id`, `correlation-id`, `correlationId` headers, in this order | Locations searched for the correlation-id. See [Correlation-id source](#correlation-id-source). |
@@ -237,6 +238,85 @@ OpenTelemetry Logs API regardless of `consoleLevel`.
 ```typescript
 app.useLogger(new TraceLogger(undefined, 'debug'));
 ```
+
+### Redacting sensitive data
+
+Every metadata object passed to a `TraceLogger` call — headers, a
+request/response body, a Kafka or RabbitMQ event, any nested structure —
+is redacted before it reaches either destination (console and the OTel
+Logs API), based on `logs.sensitiveFields`. **Nothing is redacted unless
+you configure it explicitly** — there is no built-in list applied on
+your behalf:
+
+```typescript
+TelemetryModule.forRoot({
+  serviceName: 'billing-service',
+  logs: {
+    sensitiveFields: ['cpf', 'cardNumber', 'body.customer.email'],
+  },
+});
+```
+
+A bare name (`'cpf'`) redacts that field wherever it appears, at any
+nesting depth, regardless of which transport produced it — the same rule
+applies whether it came from an HTTP request body, a Kafka message, or a
+RabbitMQ event, since matching is by field name, not by a fixed shape. A
+dot-notation path (`'body.customer.email'`) instead matches only that
+exact location, for when a bare name would be too broad. Matching is
+case-insensitive either way, and the original object passed to the log
+call is never mutated — only the copy written to the console/OTel is
+redacted.
+
+```typescript
+this.logger.log('processing event', {
+  headers: kafkaMessage.headers, // authorization redacted only if configured below
+  body: event, // cpf/cardNumber/etc. redacted per your configured list
+});
+```
+
+**Recommended starting point.** `RECOMMENDED_SENSITIVE_FIELDS` ships with
+the SDK — common credential/secret carriers seen across HTTP headers and
+message metadata (`authorization`, `cookie`, `set-cookie`, `password`,
+`token`, `secret`, `apikey`, `api-key`, `x-api-key`, `access-token`,
+`refresh-token`). It is **not** applied automatically; spread it into
+your own list to opt in:
+
+```typescript
+import { RECOMMENDED_SENSITIVE_FIELDS } from '@snokedll/otel-for-nestjs';
+
+TelemetryModule.forRoot({
+  serviceName: 'billing-service',
+  logs: {
+    sensitiveFields: [...RECOMMENDED_SENSITIVE_FIELDS, 'cpf', 'cardNumber'],
+  },
+});
+```
+
+**Customizing the placeholder.** Every redacted field's value is
+replaced by `logs.redactionPlaceholder`, which defaults to `'[REDACTED]'`
+— any string works:
+
+```typescript
+TelemetryModule.forRoot({
+  serviceName: 'billing-service',
+  logs: {
+    sensitiveFields: ['cpf', 'cardNumber'],
+    redactionPlaceholder: '***',
+  },
+});
+```
+
+```typescript
+// input
+{ headers: { authorization: 'Bearer super-secret-token' } }
+
+// what reaches the console and the OTel LogRecord, with the placeholder above
+{ headers: { authorization: '***' } }
+```
+
+The key itself is always kept — only the value is replaced. Nothing is
+ever removed or omitted entirely, so it stays visible in the log that the
+field existed and was redacted, rather than silently disappearing.
 
 ### `@Span()` and `@Measure()` decorators
 
