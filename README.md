@@ -25,8 +25,8 @@ From a single configuration, the SDK provides:
 - Trace-id/correlation-id continuity across asynchronous processing
   (queues, `setTimeout`, scheduled jobs), independent of the technology
   used.
-- Kafka event interceptor (`MessageTraceInterceptor`) for correlating
-  consumed messages.
+- Kafka and RabbitMQ event interceptor (`MessageTraceInterceptor`) for
+  correlating consumed messages.
 - Metric cardinality controls, header injection prevention, and
   prototype pollution prevention when extracting correlation-id.
 
@@ -445,6 +445,11 @@ class InvoiceProcessor extends WorkerHost {
 
 ### Consuming events
 
+`MessageTraceInterceptor` supports both `@nestjs/microservices`' Kafka and
+RabbitMQ transports — auto-detected per invocation from the shape of the
+RPC context (`KafkaContext` vs `RmqContext`), so the same interceptor
+instance instruments both if an application consumes from more than one:
+
 ```typescript
 @Controller()
 @UseInterceptors(MessageTraceInterceptor)
@@ -453,6 +458,22 @@ export class InvoicesEventsController {
   async handle(@Payload() data: unknown) { ... }
 }
 ```
+
+Both transports extract the `traceparent`/correlation-id headers and
+re-parent the invocation's trace the same way — Kafka reads them from
+`KafkaContext.getMessage().headers`, RabbitMQ from the raw AMQP message's
+`properties.headers` (`RmqContext.getMessage()`). Metrics are recorded
+separately per broker, since they're different signals in practice:
+
+| Broker | Counter | Histogram | Attributes |
+|---|---|---|---|
+| Kafka | `messaging.kafka.messages_consumed` | `messaging.kafka.processing.duration` | `topic`, `partition`, `outcome` |
+| RabbitMQ | `messaging.rabbitmq.messages_consumed` | `messaging.rabbitmq.processing.duration` | `exchange`, `routingKey`, `outcome` |
+
+A producer sets the `traceparent` header the same way regardless of
+broker — via `injectW3CTraceParent()`, same as the [trace continuity](#trace-continuity-across-asynchronous-processing)
+examples above, just written into the message's AMQP headers (or Kafka
+record headers) instead of a job payload field.
 
 ## License
 

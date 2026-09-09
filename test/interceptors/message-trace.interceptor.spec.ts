@@ -22,6 +22,10 @@ const messagesCounter = () =>
   meter.created['counter:messaging.kafka.messages_consumed'] as { add: ReturnType<typeof vi.fn> } | undefined;
 const processingDuration = () =>
   meter.created['histogram:messaging.kafka.processing.duration'] as { record: ReturnType<typeof vi.fn> } | undefined;
+const rabbitMessagesCounter = () =>
+  meter.created['counter:messaging.rabbitmq.messages_consumed'] as { add: ReturnType<typeof vi.fn> } | undefined;
+const rabbitProcessingDuration = () =>
+  meter.created['histogram:messaging.rabbitmq.processing.duration'] as { record: ReturnType<typeof vi.fn> } | undefined;
 
 const VALID_TRACE_ID = '4bf92f3577b34da6a3ce929d0e0e4736';
 const VALID_SPAN_ID = '00f067aa0ba902b7';
@@ -43,6 +47,28 @@ function createRpcContext(overrides: {
   const context = {
     getType: () => overrides.type ?? 'rpc',
     switchToRpc: () => ({ getContext: () => kafkaContext, getData: () => overrides.body }),
+  } as unknown as ExecutionContext;
+  return { context };
+}
+
+function createRmqContext(overrides: {
+  headers?: Record<string, string | Buffer | undefined>;
+  body?: unknown;
+  exchange?: string;
+  routingKey?: string;
+}) {
+  const amqpMessage = {
+    fields: { exchange: overrides.exchange ?? 'invoices', routingKey: overrides.routingKey ?? 'invoice.created' },
+    properties: { headers: overrides.headers ?? {} },
+  };
+  const rmqContext = {
+    getMessage: () => amqpMessage,
+    getChannelRef: () => ({}),
+    getPattern: () => 'invoice.created',
+  };
+  const context = {
+    getType: () => 'rpc',
+    switchToRpc: () => ({ getContext: () => rmqContext, getData: () => overrides.body }),
   } as unknown as ExecutionContext;
   return { context };
 }
@@ -78,11 +104,16 @@ beforeAll(async () => {
   // through the interceptor.
   const { context } = createRpcContext({});
   await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'warmup')));
+
+  const { context: rmqContext } = createRmqContext({});
+  await firstValueFrom(interceptor.intercept(rmqContext, callHandlerFor(() => 'warmup')));
 });
 
 beforeEach(() => {
   messagesCounter()!.add.mockClear();
   processingDuration()!.record.mockClear();
+  rabbitMessagesCounter()!.add.mockClear();
+  rabbitProcessingDuration()!.record.mockClear();
 });
 
 describe('MessageTraceInterceptor', () => {
@@ -220,5 +251,83 @@ describe('MessageTraceInterceptor', () => {
 
     const attributes = messagesCounter()!.add.mock.calls[0][1] as Record<string, unknown>;
     expect(Object.values(attributes)).not.toContain('918273');
+  });
+
+  describe('RabbitMQ (RmqContext)', () => {
+    it('detects an RmqContext (getChannelRef/getPattern) distinctly from a KafkaContext', async () => {
+      const { context } = createRmqContext({});
+
+      await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
+
+      expect(rabbitMessagesCounter()!.add).toHaveBeenCalled();
+      expect(messagesCounter()!.add).not.toHaveBeenCalled();
+    });
+
+    it('extracts the correlation id from AMQP message headers', async () => {
+      const capture: { correlationId?: string } = {};
+      const { context } = createRmqContext({ headers: { 'x-correlation-id': 'corr-amqp' } });
+
+      await firstValueFrom(interceptor.intercept(context, correlationCapturingHandler(capture)));
+
+      expect(capture.correlationId).toBe('corr-amqp');
+    });
+
+    it('re-parents the trace to a valid traceparent header found under properties.headers', async () => {
+      const capture: { traceId?: string } = {};
+      const { context } = createRmqContext({ headers: { traceparent: `00-${VALID_TRACE_ID}-${VALID_SPAN_ID}-01` } });
+
+      await firstValueFrom(interceptor.intercept(context, activeSpanCallHandler(capture)));
+
+      expect(capture.traceId).toBe(VALID_TRACE_ID);
+    });
+
+    it('ignores an absent or malformed traceparent header', async () => {
+      const capture: { traceId?: string } = {};
+      const { context } = createRmqContext({ headers: {} });
+
+      await firstValueFrom(interceptor.intercept(context, activeSpanCallHandler(capture)));
+
+      expect(capture.traceId).toBeUndefined();
+    });
+
+    it('bypasses instrumentation entirely for an ignored event', async () => {
+      const ignoringInterceptor = new MessageTraceInterceptor(
+        resolveTelemetryConfig({ serviceName: 'svc', ignoreEvents: [{ body: { name: 'HEALTH_CHECK' } }] }),
+      );
+      const { context } = createRmqContext({ body: { name: 'HEALTH_CHECK' } });
+
+      await firstValueFrom(ignoringInterceptor.intercept(context, callHandlerFor(() => 'ok')));
+
+      expect(rabbitMessagesCounter()!.add).not.toHaveBeenCalled();
+    });
+
+    it('records messaging metrics tagged with exchange, routingKey, and outcome', async () => {
+      const { context } = createRmqContext({ exchange: 'billing', routingKey: 'invoice.paid' });
+
+      await firstValueFrom(interceptor.intercept(context, callHandlerFor(() => 'ok')));
+
+      expect(rabbitMessagesCounter()!.add).toHaveBeenCalledWith(1, { exchange: 'billing', routingKey: 'invoice.paid', outcome: 'success' });
+      expect(rabbitProcessingDuration()!.record).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({ outcome: 'success' }));
+    });
+
+    it('records an error outcome and rethrows when the handler errors', async () => {
+      const { context } = createRmqContext({});
+      const failure = new Error('processing failed');
+
+      await expect(firstValueFrom(interceptor.intercept(context, errorCallHandler(failure)))).rejects.toBe(failure);
+
+      expect(rabbitMessagesCounter()!.add).toHaveBeenCalledWith(1, expect.objectContaining({ outcome: 'error' }));
+    });
+
+    it('never mixes Kafka and RabbitMQ metrics when the same interceptor instance handles both', async () => {
+      const { context: kafkaContext } = createRpcContext({ topic: 'invoice.created', partition: 1 });
+      const { context: rmqContext } = createRmqContext({ exchange: 'invoices', routingKey: 'invoice.created' });
+
+      await firstValueFrom(interceptor.intercept(kafkaContext, callHandlerFor(() => 'ok')));
+      await firstValueFrom(interceptor.intercept(rmqContext, callHandlerFor(() => 'ok')));
+
+      expect(messagesCounter()!.add).toHaveBeenCalledWith(1, { topic: 'invoice.created', partition: 1, outcome: 'success' });
+      expect(rabbitMessagesCounter()!.add).toHaveBeenCalledWith(1, { exchange: 'invoices', routingKey: 'invoice.created', outcome: 'success' });
+    });
   });
 });
