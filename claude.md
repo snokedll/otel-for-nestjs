@@ -1304,11 +1304,66 @@ entrada nova se descobrir algo que não estava documentado.
     por padrão pra quem não configurar nada — mas ainda assim é MINOR,
     não PATCH, por ser capacidade nova.
 
+47. **`MessageTraceInterceptor` agora suporta RabbitMQ além de Kafka —
+    detecção automática por invocação, mesma classe, sem API pública
+    nova.** Motivado por pergunta do usuário sobre onde `@ContinueTrace`
+    lê o header AMQP — resposta correta foi "não lê, nunca leu" (ele
+    resume um `TraceCarrier` do PAYLOAD, capturado via
+    `captureTraceCarrier()`, mecanismo diferente); quem lê header W3C
+    `traceparent` de verdade é o `MessageTraceInterceptor`, que só tinha
+    Kafka implementado. Isso já estava registrado como pendência
+    ("O que ainda NÃO foi construído") desde a decisão 11.
+
+    Design: `extractSignalContext` agora faz duck-typing no objeto
+    retornado por `context.switchToRpc().getContext()` pra decidir qual
+    dos dois brokers está em jogo — `getTopic`+`getPartition` (presentes
+    só em `KafkaContext`) vs `getChannelRef`+`getPattern` (presentes só em
+    `RmqContext`). Confirmado contra o código-fonte real instalado
+    (`sandbox/node_modules/@nestjs/microservices/ctx-host/{kafka,rmq}.context.d.ts`)
+    que os dois pares de métodos realmente não se sobrepõem — não é uma
+    suposição, foi lido e comparado byte a byte antes de escrever a
+    lógica de detecção. Resultado tipado como union
+    (`KafkaSignalContext | RabbitMqSignalContext`), com `recordOutcome`
+    ramificando por `broker` pra escolher qual par counter/histogram e
+    quais atributos usar.
+
+    Métricas mantidas SEPARADAS por broker, não generalizadas com um
+    atributo `broker`/`transport` comum — `messaging.kafka.*` (`topic`,
+    `partition`) fica exatamente como estava (nada muda pra quem já usa
+    Kafka, sem exigir nova major version), `messaging.rabbitmq.*`
+    (`exchange`, `routingKey`) é aditivo. `exchange`/`routingKey` foram
+    escolhidos como equivalente RabbitMQ de `topic`/`partition` por serem
+    strings de baixa cardinalidade (definidas em tempo de configuração do
+    binding, não por mensagem) — mesmo raciocínio de cardinalidade já
+    documentado pra `MetricsService`.
+
+    Extração de header generalizada: `headerValueToString`/`buildCarrier`
+    (antes só Kafka, `Buffer | string | array`) passaram a aceitar também
+    `number | boolean`, já que o formato AMQP field-table do `amqplib`
+    permite esses tipos em `properties.headers` — Kafka continua
+    funcionando igual (só strings/Buffers na prática), RabbitMQ ganha
+    cobertura mais realista sem precisar de duas funções quase-idênticas.
+
+    Validado empiricamente contra o `dist/` real (não só teste unitário):
+    script standalone construindo um objeto `RmqContext`-shaped fiel ao
+    real (`getMessage()` retornando `{content, fields, properties}`,
+    `getChannelRef()`, `getPattern()`), simulando um producer que grava
+    `traceparent`/`x-correlation-id` em `properties.headers` — confirmado
+    que o handler do consumer via `MessageTraceInterceptor` resume
+    corretamente pro MESMO trace ID do producer, e resolve o
+    correlation-id certo. Achado interessante nessa validação (não é bug,
+    é comportamento correto e já esperado): rodar isso fora do Vitest
+    exige registrar manualmente um `AsyncLocalStorageContextManager`
+    (`context.setGlobalContextManager(...)`) — sem isso, `context.with()`/
+    `trace.getActiveSpan()` são no-ops contra o `NoopContextManager`
+    padrão da API. Em produção isso já vem resolvido pelo
+    `initializeTelemetry()`/`NodeSDK.start()`; em teste, o
+    `test/support/setup.ts` já faz exatamente essa mesma coisa — é por
+    isso que a suite Vitest sempre funcionou sem precisar disso
+    explicitamente em cada teste.
+
 ## O que ainda NÃO foi construído
 
-- `MessageTraceInterceptor` pra RabbitMQ (Kafka já está pronto — ver
-  decisão 11; RabbitMQ precisaria de extração de headers própria, formato
-  `amqplib` é diferente do `KafkaContext`)
 - Dashboards prontos do Grafana (só datasources provisionadas, sem
   dashboard custom)
 - `package.json` não tem `repository`/`homepage`/`bugs` — preencher quando
